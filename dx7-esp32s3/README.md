@@ -37,6 +37,9 @@ cargo +esp build --release --features pwm
 
 # Real hardware — ESP32S3-1.28inch-BOX board, I2S audio via ES8311
 cargo +esp build --release --features es8311
+
+# Real hardware — BLE MIDI + ES8311 audio
+cargo +esp build --release --features "ble-midi,es8311"
 ```
 
 ## Run
@@ -78,6 +81,17 @@ Pin mapping:
 | I2C SCL (codec) | 14 |
 | I2C SDA (codec) | 15 |
 | PA enable | 46 |
+
+## BLE MIDI
+
+The `ble-midi` feature enables wireless MIDI input over Bluetooth Low Energy. Combine with an audio output feature (e.g. `es8311`).
+
+- Advertises as **"DX7"**
+- Implements the standard [MIDI over BLE](https://www.midi.org/specifications/midi-transports-specifications/specification-for-midi-over-bluetooth-low-energy-ble-midi) service
+- Supports Note On/Off, Control Change, and Program Change
+- Uses [trouble-host](https://github.com/embassy-rs/trouble) for the BLE GATT server and [esp-radio](https://github.com/esp-rs/esp-hal) for the radio driver
+
+Connect from any BLE MIDI controller or app (e.g. KORG microKEY Air, macOS Audio MIDI Setup, Android MIDI).
 
 ## Benchmark
 
