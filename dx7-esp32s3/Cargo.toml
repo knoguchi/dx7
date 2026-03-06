@@ -10,11 +10,19 @@ esp-println = { version = "0.16", default-features = false, features = ["esp32s3
 esp-backtrace = { version = "0.18", features = ["esp32s3", "panic-handler", "println"] }
 esp-alloc = "0.9"
 xtensa-lx = "0.13"
+esp-radio = { version = "0.17", default-features = false, features = ["esp32s3", "ble", "unstable"], optional = true }
+esp-rtos = { version = "0.2", features = ["esp-radio", "embassy", "esp32s3"], optional = true }
+trouble-host = { version = "0.5.1", default-features = false, features = ["peripheral", "gatt", "derive", "default-packet-pool", "default-packet-pool-mtu-255"], optional = true }
+embassy-executor = { version = "0.9", optional = true }
+embassy-futures = { version = "0.1", optional = true }
+embassy-sync = { version = "0.7", optional = true }
+static_cell = { version = "2.1", optional = true }
 
 [features]
 qemu = []
 pwm = []
 es8311 = []
+ble-midi = ["dep:esp-radio", "dep:esp-rtos", "dep:trouble-host", "dep:embassy-executor", "dep:embassy-futures", "dep:embassy-sync", "dep:static_cell"]
 
 [patch.crates-io]
 esp-rom-sys = { path = "patches/esp-rom-sys" }
