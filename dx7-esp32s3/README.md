@@ -19,7 +19,10 @@ export PATH="$XTENSA_BIN:$PATH"
 # 4. Install flashing tool
 cargo binstall espflash
 
-# 5. For QEMU (optional): install Espressif QEMU fork
+# 5. Apply esp-rom-sys patch (fixes Rust nightly compat)
+cd dx7-esp32s3 && bash patches/apply.sh
+
+# 6. For QEMU (optional): install Espressif QEMU fork
 #    https://github.com/espressif/qemu
 ```
 

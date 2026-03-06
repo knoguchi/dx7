@@ -1,0 +1,22 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -83,7 +83,7 @@
+             let s1_i = s1.add(i);
+             let s2_i = s2.add(i);
+
+-            let val = (*s1_i).to_ascii_lowercase() as i32 - (*s2_i).to_ascii_lowercase() as i32;
++            let val = ((*s1_i) as u8).to_ascii_lowercase() as i32 - ((*s2_i) as u8).to_ascii_lowercase() as i32;
+             if val != 0 || *s1_i == 0 {
+                 return val;
+             }
+--- a/src/syscall/mod.rs
++++ b/src/syscall/mod.rs
+@@ -70,7 +70,7 @@
+ ///
+ /// # Safety
+ /// Should only get called once.
+-#[allow(clippy::missing_transmute_annotations)]
++#[allow(clippy::missing_transmute_annotations, function_casts_as_integer)]
+ pub unsafe fn init_syscall_table() {
+     let syscall_table = unsafe {
+         (&mut *core::ptr::addr_of_mut!(S_STUB_TABLE)).write(chip_specific::syscall_stub_table {
