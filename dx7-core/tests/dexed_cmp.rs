@@ -15,9 +15,9 @@ fn ensure_init() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        tables::init_tables(44100.0);
-        dx7_core::lfo::init_lfo(44100.0);
-        dx7_core::pitchenv::init_pitchenv(44100.0);
+        tables::init_tables(44100);
+        dx7_core::lfo::init_lfo(44100);
+        dx7_core::pitchenv::init_pitchenv(44100);
     });
 }
 
@@ -356,7 +356,7 @@ fn test_full_pipeline_flunk_bass_vs_dexed() {
     // Also render our Rust full output chain (Synth + DC blocker) to WAV
     {
         let v2 = DxVoice::from_packed(&DxVoice::FLUNK_BASS_PACKED);
-        let mut synth = dx7_core::Synth::new(44100.0);
+        let mut synth = dx7_core::Synth::new(44100);
         synth.load_patch(v2);
         // Dexed default: no master volume scaling (it's applied per-sample as 1.0)
         synth.set_master_volume(1.0);

@@ -3,6 +3,7 @@
 //! Ported from Dexed/MSFA lfo.cc (Apache 2.0, Google Inc.).
 //! All waveform outputs are in Q24 range (0..1<<24).
 
+use crate::generated_tables;
 use crate::tables;
 
 /// LFO waveform types.
@@ -65,40 +66,28 @@ impl Default for LfoParams {
     }
 }
 
-/// LFO frequency source table (100 entries, Hz values measured from DX7).
-static LFO_SOURCE: [f64; 100] = [
-    0.062541, 0.125031, 0.312393, 0.437120, 0.624610,
-    0.750694, 0.936330, 1.125302, 1.249609, 1.436782,
-    1.560915, 1.752081, 1.875117, 2.062494, 2.247191,
-    2.374451, 2.560492, 2.686728, 2.873976, 2.998950,
-    3.188013, 3.369840, 3.500175, 3.682224, 3.812065,
-    4.000800, 4.186202, 4.310716, 4.501260, 4.623209,
-    4.814636, 4.930480, 5.121901, 5.315191, 5.434783,
-    5.617346, 5.750431, 5.946717, 6.062811, 6.248438,
-    6.431695, 6.564264, 6.749460, 6.868132, 7.052186,
-    7.250580, 7.375719, 7.556294, 7.687577, 7.877738,
-    7.993605, 8.181967, 8.372405, 8.504848, 8.685079,
-    8.810573, 8.986341, 9.122423, 9.300595, 9.500285,
-    9.607994, 9.798158, 9.950249, 10.117361, 11.251125,
-    11.384335, 12.562814, 13.676149, 13.904338, 15.092062,
-    16.366612, 16.638935, 17.869907, 19.193858, 19.425019,
-    20.833333, 21.034918, 22.502250, 24.003841, 24.260068,
-    25.746653, 27.173913, 27.578599, 29.052876, 30.693677,
-    31.191516, 32.658393, 34.317090, 34.674064, 36.416606,
-    38.197097, 38.550501, 40.387722, 40.749796, 42.625746,
-    44.326241, 44.883303, 46.772685, 48.590865, 49.261084,
-];
-
 /// Static LFO parameters derived from sample rate (shared across all voices).
 static mut LFO_UNIT: u32 = 0;
 static mut LFO_RATIO: u32 = 0;
 
 /// Initialize LFO statics (called once from init_tables flow).
-pub fn init_lfo(sample_rate: f64) {
+/// Only 44100 and 48000 Hz are supported.
+pub fn init_lfo(sample_rate: u32) {
     unsafe {
-        LFO_UNIT = (tables::N as f64 * 25190424.0 / sample_rate + 0.5) as u32;
-        let ratio = 4437500000.0 * tables::N as f64;
-        LFO_RATIO = (ratio / sample_rate) as u32;
+        match sample_rate {
+            48000 => {
+                // N * 25190424 / 48000 + 0.5 = 33587
+                LFO_UNIT = 33587;
+                // 4437500000 * N / 48000 = 5916666
+                LFO_RATIO = 5916666;
+            }
+            _ => {
+                // N * 25190424 / 44100 + 0.5 = 36559
+                LFO_UNIT = 36559;
+                // 4437500000 * N / 44100 = 6440362
+                LFO_RATIO = 6440362;
+            }
+        }
     }
 }
 
@@ -133,7 +122,8 @@ impl Lfo {
     pub fn reset(&mut self, lfo_params: &LfoParams) {
         let rate = lfo_params.speed.min(99) as usize;
         let lforatio = unsafe { LFO_RATIO };
-        self.delta = (LFO_SOURCE[rate] * lforatio as f64) as u32;
+        // LFO_SOURCE_FIXED is Q24; multiply and shift back.
+        self.delta = ((generated_tables::LFO_SOURCE_FIXED[rate] as u64 * lforatio as u64) >> 24) as u32;
 
         let a_raw = 99i32 - lfo_params.delay as i32;
         let unit = unsafe { LFO_UNIT };

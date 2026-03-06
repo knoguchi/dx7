@@ -536,9 +536,9 @@ mod tests {
         use std::sync::Once;
         static INIT: Once = Once::new();
         INIT.call_once(|| {
-            tables::init_tables(44100.0);
-            crate::lfo::init_lfo(44100.0);
-            crate::pitchenv::init_pitchenv(44100.0);
+            tables::init_tables(44100);
+            crate::lfo::init_lfo(44100);
+            crate::pitchenv::init_pitchenv(44100);
         });
     }
 
@@ -904,7 +904,7 @@ mod tests {
     #[test]
     fn test_synth_single_note_output_range() {
         ensure_init();
-        let mut synth = crate::synth::Synth::new(44100.0);
+        let mut synth = crate::synth::Synth::new(44100);
         let patch = DxVoice::init_voice();
         synth.load_patch(patch);
 
@@ -1207,7 +1207,7 @@ mod tests {
     #[test]
     fn test_polyphony_two_notes() {
         ensure_init();
-        let mut synth = crate::synth::Synth::new(44100.0);
+        let mut synth = crate::synth::Synth::new(44100);
         let patch = test_patch(31, [0, 0, 0, 0, 0, 99], 0);
         synth.load_patch(patch);
 
@@ -1222,7 +1222,7 @@ mod tests {
         let peak_two = output.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
 
         // Now play one note
-        let mut synth2 = crate::synth::Synth::new(44100.0);
+        let mut synth2 = crate::synth::Synth::new(44100);
         synth2.load_patch(test_patch(31, [0, 0, 0, 0, 0, 99], 0));
         synth2.note_on(60, 100);
 
@@ -1240,7 +1240,7 @@ mod tests {
     #[test]
     fn test_note_off_releases() {
         ensure_init();
-        let mut synth = crate::synth::Synth::new(44100.0);
+        let mut synth = crate::synth::Synth::new(44100);
         let patch = test_patch(31, [0, 0, 0, 0, 0, 99], 0);
         synth.load_patch(patch);
 
@@ -1273,7 +1273,7 @@ mod tests {
     #[test]
     fn test_sustain_pedal() {
         ensure_init();
-        let mut synth = crate::synth::Synth::new(44100.0);
+        let mut synth = crate::synth::Synth::new(44100);
         synth.load_patch(test_patch(31, [0, 0, 0, 0, 0, 99], 0));
 
         // Sustain pedal on (CC64 >= 64)
@@ -1314,7 +1314,7 @@ mod tests {
     #[test]
     fn test_pitch_bend_changes_frequency() {
         ensure_init();
-        let mut synth = crate::synth::Synth::new(44100.0);
+        let mut synth = crate::synth::Synth::new(44100);
         synth.load_patch(test_patch(31, [0, 0, 0, 0, 0, 99], 0));
 
         // Play note without pitch bend
@@ -1326,7 +1326,7 @@ mod tests {
             .count();
 
         // Reset and play with max pitch bend up (+8191)
-        let mut synth2 = crate::synth::Synth::new(44100.0);
+        let mut synth2 = crate::synth::Synth::new(44100);
         synth2.load_patch(test_patch(31, [0, 0, 0, 0, 0, 99], 0));
         synth2.note_on(60, 100);
         synth2.pitch_bend(8191); // max up
@@ -1360,7 +1360,7 @@ mod tests {
         ensure_init();
         let patch = test_patch(31, [0, 0, 0, 0, 0, 99], 0);
 
-        let mut synth_loud = crate::synth::Synth::new(44100.0);
+        let mut synth_loud = crate::synth::Synth::new(44100);
         synth_loud.load_patch(patch.clone());
         synth_loud.set_master_volume(1.0);
         synth_loud.note_on(60, 100);
@@ -1368,7 +1368,7 @@ mod tests {
         synth_loud.render(&mut loud);
         let peak_loud = loud.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
 
-        let mut synth_quiet = crate::synth::Synth::new(44100.0);
+        let mut synth_quiet = crate::synth::Synth::new(44100);
         synth_quiet.load_patch(patch);
         synth_quiet.set_master_volume(0.1);
         synth_quiet.note_on(60, 100);
@@ -1388,14 +1388,14 @@ mod tests {
         ensure_init();
         let patch = test_patch(31, [0, 0, 0, 0, 0, 99], 0);
 
-        let mut synth_full = crate::synth::Synth::new(44100.0);
+        let mut synth_full = crate::synth::Synth::new(44100);
         synth_full.load_patch(patch.clone());
         synth_full.note_on(60, 100);
         let mut full = vec![0.0f32; 2048];
         synth_full.render(&mut full);
         let peak_full = full.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
 
-        let mut synth_half = crate::synth::Synth::new(44100.0);
+        let mut synth_half = crate::synth::Synth::new(44100);
         synth_half.load_patch(patch);
         synth_half.control_change(11, 64); // expression ~50%
         synth_half.note_on(60, 100);
@@ -1416,7 +1416,7 @@ mod tests {
     #[test]
     fn test_process_midi_note_on_off() {
         ensure_init();
-        let mut synth = crate::synth::Synth::new(44100.0);
+        let mut synth = crate::synth::Synth::new(44100);
         synth.load_patch(test_patch(31, [0, 0, 0, 0, 0, 99], 0));
 
         // Note On: status=0x90, note=60, velocity=100
@@ -1443,7 +1443,7 @@ mod tests {
     #[test]
     fn test_process_midi_velocity_zero_is_note_off() {
         ensure_init();
-        let mut synth = crate::synth::Synth::new(44100.0);
+        let mut synth = crate::synth::Synth::new(44100);
         synth.load_patch(test_patch(31, [0, 0, 0, 0, 0, 99], 0));
 
         // Note on with velocity 100
@@ -1467,7 +1467,7 @@ mod tests {
     #[test]
     fn test_process_midi_pitch_bend() {
         ensure_init();
-        let mut synth = crate::synth::Synth::new(44100.0);
+        let mut synth = crate::synth::Synth::new(44100);
         synth.load_patch(test_patch(31, [0, 0, 0, 0, 0, 99], 0));
         synth.note_on(60, 100);
 

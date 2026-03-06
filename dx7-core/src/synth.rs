@@ -20,7 +20,7 @@ pub enum SynthCommand {
 pub struct Synth {
     voices: Vec<Voice>,
     current_patch: DxVoice,
-    _sample_rate: f64,
+    _sample_rate: u32,
     sustain: bool,
     sustained_notes: Vec<u8>,
     master_volume: f32,
@@ -40,11 +40,11 @@ pub struct Synth {
 }
 
 impl Synth {
-    pub fn new(sample_rate: f64) -> Self {
+    pub fn new(sample_rate: u32) -> Self {
         Self::with_max_voices(sample_rate, DEFAULT_MAX_VOICES)
     }
 
-    pub fn with_max_voices(sample_rate: f64, max_voices: usize) -> Self {
+    pub fn with_max_voices(sample_rate: u32, max_voices: usize) -> Self {
         // Initialize all lookup tables (must be done once before any rendering)
         tables::init_tables(sample_rate);
         crate::lfo::init_lfo(sample_rate);

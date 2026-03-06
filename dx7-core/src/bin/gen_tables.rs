@@ -19,6 +19,10 @@ fn main() {
     gen_fine_tab();
     gen_detune_tab();
     gen_amp_mod_exp_tab();
+    gen_midinote_logfreq();
+    gen_lfo_source_fixed();
+    gen_freqlut(44100.0, "FREQLUT_44100");
+    gen_freqlut(48000.0, "FREQLUT_48000");
 }
 
 fn gen_sintab() {
@@ -118,6 +122,61 @@ fn gen_amp_mod_exp_tab() {
         tab[i as usize] = ((i as f64 * 0.07 + 12.2).exp()) as u32;
     }
     print_u32_array("AMP_MOD_EXP_TAB", &tab);
+}
+
+fn gen_midinote_logfreq() {
+    let mut tab = [0i32; 128];
+    for note in 0..128i32 {
+        tab[note as usize] = midinote_to_logfreq(note);
+    }
+    print_i32_array("MIDINOTE_LOGFREQ", &tab);
+}
+
+/// LFO frequency source table (Hz, measured from DX7) scaled to Q24.
+fn gen_lfo_source_fixed() {
+    let lfo_source: [f64; 100] = [
+        0.062541, 0.125031, 0.312393, 0.437120, 0.624610,
+        0.750694, 0.936330, 1.125302, 1.249609, 1.436782,
+        1.560915, 1.752081, 1.875117, 2.062494, 2.247191,
+        2.374451, 2.560492, 2.686728, 2.873976, 2.998950,
+        3.188013, 3.369840, 3.500175, 3.682224, 3.812065,
+        4.000800, 4.186202, 4.310716, 4.501260, 4.623209,
+        4.814636, 4.930480, 5.121901, 5.315191, 5.434783,
+        5.617346, 5.750431, 5.946717, 6.062811, 6.248438,
+        6.431695, 6.564264, 6.749460, 6.868132, 7.052186,
+        7.250580, 7.375719, 7.556294, 7.687577, 7.877738,
+        7.993605, 8.181967, 8.372405, 8.504848, 8.685079,
+        8.810573, 8.986341, 9.122423, 9.300595, 9.500285,
+        9.607994, 9.798158, 9.950249, 10.117361, 11.251125,
+        11.384335, 12.562814, 13.676149, 13.904338, 15.092062,
+        16.366612, 16.638935, 17.869907, 19.193858, 19.425019,
+        20.833333, 21.034918, 22.502250, 24.003841, 24.260068,
+        25.746653, 27.173913, 27.578599, 29.052876, 30.693677,
+        31.191516, 32.658393, 34.317090, 34.674064, 36.416606,
+        38.197097, 38.550501, 40.387722, 40.749796, 42.625746,
+        44.326241, 44.883303, 46.772685, 48.590865, 49.261084,
+    ];
+    let mut tab = [0u32; 100];
+    for i in 0..100 {
+        tab[i] = (lfo_source[i] * ((1u64 << 24) as f64) + 0.5) as u32;
+    }
+    print_u32_array("LFO_SOURCE_FIXED", &tab);
+}
+
+/// Frequency lookup table for a given sample rate.
+fn gen_freqlut(sample_rate: f64, name: &str) {
+    const FREQ_LG_N_SAMPLES: i32 = 10;
+    const FREQ_N_SAMPLES: usize = 1 << FREQ_LG_N_SAMPLES as usize;
+    const FREQ_MAX_LOGFREQ_INT: i32 = 20;
+    const FREQ_INC: f64 = 1.000_677_130_693_066_4; // 2^(1/1024)
+
+    let mut tab = [0i32; FREQ_N_SAMPLES + 1];
+    let mut y: f64 = ((1i64 << (24 + FREQ_MAX_LOGFREQ_INT)) as f64) / sample_rate;
+    for i in 0..=FREQ_N_SAMPLES {
+        tab[i] = (y + 0.5) as i32;
+        y *= FREQ_INC;
+    }
+    print_i32_array(name, &tab);
 }
 
 fn print_i32_array(name: &str, data: &[i32]) {

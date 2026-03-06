@@ -120,7 +120,7 @@ fn main() {
 
     let sysex_dir = "sysex";
     let mut cache: HashMap<&str, Vec<DxVoice>> = HashMap::new();
-    let mut synth = Synth::new(sr);
+    let mut synth = Synth::new(sample_rate);
     let mut all_samples: Vec<f32> = Vec::new();
 
     for cand in &candidates {

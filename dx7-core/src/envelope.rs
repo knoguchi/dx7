@@ -212,7 +212,7 @@ mod tests {
         use std::sync::Once;
         static INIT: Once = Once::new();
         INIT.call_once(|| {
-            tables::init_tables(44100.0);
+            tables::init_tables(44100);
         });
     }
 

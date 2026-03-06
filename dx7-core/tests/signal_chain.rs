@@ -8,9 +8,9 @@ use std::sync::Once;
 static INIT: Once = Once::new();
 fn ensure_init() {
     INIT.call_once(|| {
-        dx7_core::tables::init_tables(44100.0);
-        dx7_core::lfo::init_lfo(44100.0);
-        dx7_core::pitchenv::init_pitchenv(44100.0);
+        dx7_core::tables::init_tables(44100);
+        dx7_core::lfo::init_lfo(44100);
+        dx7_core::pitchenv::init_pitchenv(44100);
     });
 }
 
@@ -908,7 +908,7 @@ mod synth_tests {
     fn synth_renders_epiano1_note() {
         ensure_init();
         let patch = rom1a::load_rom1a_voice(10).unwrap();
-        let mut synth = Synth::new(44100.0);
+        let mut synth = Synth::new(44100);
         synth.load_patch(patch);
 
         // Note on
@@ -959,7 +959,7 @@ mod synth_tests {
     fn synth_brass1_renders() {
         ensure_init();
         let patch = rom1a::load_rom1a_voice(0).unwrap();
-        let mut synth = Synth::new(44100.0);
+        let mut synth = Synth::new(44100);
         synth.load_patch(patch);
 
         synth.note_on(60, 100);

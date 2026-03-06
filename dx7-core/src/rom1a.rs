@@ -571,6 +571,7 @@ pub const ROM1A_VOICE_NAMES: [&str; 32] = [
 ];
 
 /// Load all 32 ROM1A factory voices.
+#[cfg(feature = "std")]
 pub fn load_rom1a() -> Vec<DxVoice> {
     let mut voices = Vec::with_capacity(32);
     for i in 0..32 {
@@ -595,6 +596,7 @@ pub fn load_rom1a_voice(index: usize) -> Option<DxVoice> {
 
 /// Build a complete SysEx bulk dump message (4104 bytes).
 /// Format: F0 43 00 09 20 00 <4096 bytes> <checksum> F7
+#[cfg(feature = "std")]
 pub fn rom1a_sysex_dump() -> Vec<u8> {
     let mut sysex = Vec::with_capacity(4104);
     sysex.push(0xF0);

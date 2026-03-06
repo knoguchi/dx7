@@ -33,7 +33,7 @@ impl AudioEngine {
         let command_tx = Arc::new(Mutex::new(command_tx));
 
         // Create synth on the audio thread side
-        let mut synth = dx7_core::Synth::new(sample_rate as f64);
+        let mut synth = dx7_core::Synth::new(sample_rate);
         synth.load_patch(initial_patch);
 
         let channels = config.channels as usize;

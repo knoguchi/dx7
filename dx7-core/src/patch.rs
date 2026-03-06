@@ -405,6 +405,7 @@ impl DxVoice {
     /// Parse a 32-voice bulk dump SysEx message.
     /// Expected format: F0 43 0s 09 20 00 <4096 bytes> <checksum> F7
     /// Returns up to 32 voices, or an error message.
+    #[cfg(feature = "std")]
     pub fn parse_bulk_dump(data: &[u8]) -> Result<Vec<DxVoice>, &'static str> {
         if data.len() < 4104 {
             return Err("Data too short for bulk dump");

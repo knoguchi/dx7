@@ -1,8 +1,8 @@
 #[test]
 fn dump_epiano1_params() {
-    dx7_core::tables::init_tables(44100.0);
-    dx7_core::lfo::init_lfo(44100.0);
-    dx7_core::pitchenv::init_pitchenv(44100.0);
+    dx7_core::tables::init_tables(44100);
+    dx7_core::lfo::init_lfo(44100);
+    dx7_core::pitchenv::init_pitchenv(44100);
     
     let v = dx7_core::preset::e_piano_1();
     eprintln!("=== E.PIANO 1 ===");

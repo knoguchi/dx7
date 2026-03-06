@@ -1,3 +1,4 @@
 [workspace]
 members = ["dx7-core", "dx7-app"]
+exclude = ["dx7-esp32s3"]
 resolver = "2"

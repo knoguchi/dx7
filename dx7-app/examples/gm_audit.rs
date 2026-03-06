@@ -271,7 +271,7 @@ fn main() {
     }
 
     let mut all_samples: Vec<f32> = Vec::new();
-    let mut synth = Synth::new(sr);
+    let mut synth = Synth::new(sample_rate);
 
     for prog in 0..128u8 {
         let patch = &patches[prog as usize];

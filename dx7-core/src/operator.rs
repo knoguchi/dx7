@@ -417,9 +417,9 @@ mod tests {
         use std::sync::Once;
         static INIT: Once = Once::new();
         INIT.call_once(|| {
-            tables::init_tables(44100.0);
-            crate::lfo::init_lfo(44100.0);
-            crate::pitchenv::init_pitchenv(44100.0);
+            tables::init_tables(44100);
+            crate::lfo::init_lfo(44100);
+            crate::pitchenv::init_pitchenv(44100);
         });
     }
 

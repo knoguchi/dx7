@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use std::fs;
 
 fn main() {
-    let sr = 44100.0;
+    let sample_rate = 44100u32;
+    let sr = sample_rate as f64;
     let note_on = (1.5 * sr) as usize;
     let release = (0.8 * sr) as usize;
     let gap = (0.4 * sr) as usize;
@@ -26,7 +27,7 @@ fn main() {
     ];
 
     let mut cache: HashMap<&str, Vec<DxVoice>> = HashMap::new();
-    let mut synth = Synth::new(sr);
+    let mut synth = Synth::new(sample_rate);
     let mut all: Vec<f32> = Vec::new();
 
     for &(file, idx, label) in &patches {

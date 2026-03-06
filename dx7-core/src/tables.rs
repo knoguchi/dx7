@@ -19,13 +19,8 @@ const EXP2_LG_N_SAMPLES: i32 = 10;
 const EXP2_N_SAMPLES: usize = 1 << EXP2_LG_N_SAMPLES as usize;
 
 // --- Frequency LUT ---
-const FREQ_LG_N_SAMPLES: i32 = 10;
-const FREQ_N_SAMPLES: usize = 1 << FREQ_LG_N_SAMPLES as usize;
-const FREQ_SAMPLE_SHIFT: i32 = 24 - FREQ_LG_N_SAMPLES;
+const FREQ_SAMPLE_SHIFT: i32 = 24 - 10; // 14
 const FREQ_MAX_LOGFREQ_INT: i32 = 20;
-
-// FREQLUT depends on sample_rate so it stays runtime-initialized.
-static mut FREQLUT: [i32; FREQ_N_SAMPLES + 1] = [0; FREQ_N_SAMPLES + 1];
 
 // --- MkI (Mark I) engine tables ---
 // OPL-style log-domain sine/exp lookup for DX7-accurate FM synthesis.
@@ -36,12 +31,27 @@ pub const ENV_MAX: u16 = 1 << ENV_BITDEPTH; // 16384
 /// sr_multiplier = (44100 / sample_rate) * (1 << 24)
 static mut SR_MULTIPLIER: u32 = 1 << 24;
 
+/// Pointer to the active FREQLUT (selected by sample rate at init).
+static mut FREQLUT: *const i32 = core::ptr::null();
+
 /// Initialize all lookup tables. Must be called once at startup before any
 /// audio rendering. Not thread-safe — call from a single thread.
-pub fn init_tables(sample_rate: f64) {
+///
+/// Only 44100 and 48000 Hz are supported.
+pub fn init_tables(sample_rate: u32) {
     unsafe {
-        init_freq_table(sample_rate);
-        SR_MULTIPLIER = ((44100.0 / sample_rate) * ((1u64 << 24) as f64)) as u32;
+        match sample_rate {
+            48000 => {
+                FREQLUT = generated_tables::FREQLUT_48000.as_ptr();
+                // (44100 / 48000) * (1 << 24) = 15420469
+                SR_MULTIPLIER = 15420469;
+            }
+            _ => {
+                // Default to 44100
+                FREQLUT = generated_tables::FREQLUT_44100.as_ptr();
+                SR_MULTIPLIER = 1 << 24;
+            }
+        }
     }
 }
 
@@ -50,20 +60,6 @@ pub fn init_tables(sample_rate: f64) {
 #[inline]
 pub fn sr_multiplier() -> u32 {
     unsafe { SR_MULTIPLIER }
-}
-
-// --- Frequency table initialization ---
-
-/// Precomputed 2^(1/1024) to avoid exp2() at runtime.
-const FREQ_INC: f64 = 1.000_677_130_693_066_4;
-
-unsafe fn init_freq_table(sample_rate: f64) {
-    let mut y: f64 = ((1i64 << (24 + FREQ_MAX_LOGFREQ_INT)) as f64) / sample_rate;
-
-    for i in 0..=FREQ_N_SAMPLES {
-        FREQLUT[i] = (y + 0.5) as i32;
-        y *= FREQ_INC;
-    }
 }
 
 // --- Lookup functions (hot path, ported from sin.h, exp2.h, freqlut.cc) ---
@@ -113,8 +109,8 @@ pub fn freqlut_lookup(logfreq: i32) -> i32 {
     let ix = ((logfreq & 0xffffff) >> FREQ_SAMPLE_SHIFT) as usize;
 
     unsafe {
-        let y0 = FREQLUT[ix];
-        let y1 = FREQLUT[ix + 1];
+        let y0 = *FREQLUT.add(ix);
+        let y1 = *FREQLUT.add(ix + 1);
         let lowbits = logfreq & ((1 << FREQ_SAMPLE_SHIFT) - 1);
         let y = y0 + ((((y1 - y0) as i64) * (lowbits as i64)) >> FREQ_SAMPLE_SHIFT) as i32;
         let hibits = logfreq >> 24;
@@ -146,10 +142,9 @@ pub fn sin_exp(index: u16) -> u16 {
 
 /// Convert MIDI note number to Q24 logfreq (standard 12-TET, A4=440Hz).
 /// logfreq = log2(freq) * (1 << 24).
+#[inline]
 pub fn midinote_to_logfreq(note: i32) -> i32 {
-    const LOG2_440: f64 = 8.781_359_713_524_66;
-    let logfreq = (LOG2_440 + (note as f64 - 69.0) / 12.0) * ((1i64 << 24) as f64);
-    (logfreq + 0.5) as i32
+    generated_tables::MIDINOTE_LOGFREQ[(note as usize) & 127]
 }
 
 // --- Legacy compat (kept during migration) ---
@@ -165,9 +160,9 @@ mod tests {
         use std::sync::Once;
         static INIT: Once = Once::new();
         INIT.call_once(|| {
-            init_tables(44100.0);
-            crate::lfo::init_lfo(44100.0);
-            crate::pitchenv::init_pitchenv(44100.0);
+            init_tables(44100);
+            crate::lfo::init_lfo(44100);
+            crate::pitchenv::init_pitchenv(44100);
         });
     }
 

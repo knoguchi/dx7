@@ -3,8 +3,6 @@
 //! Ported from Dexed/MSFA pitchenv.cc (Apache 2.0, Google Inc.).
 //! Output is in Q24/octave format.
 
-use crate::tables;
-
 /// Pitch envelope rate table (maps DX7 rate 0..99 to internal rate).
 static PITCHENV_RATE: [u8; 100] = [
     1, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12,
@@ -30,10 +28,15 @@ static PITCHENV_TAB: [i8; 100] = [
 static mut PITCHENV_UNIT: i32 = 0;
 
 /// Initialize pitch envelope statics (called once from init_tables flow).
-pub fn init_pitchenv(sample_rate: f64) {
+/// Only 44100 and 48000 Hz are supported.
+pub fn init_pitchenv(sample_rate: u32) {
     unsafe {
-        PITCHENV_UNIT =
-            (tables::N as f64 * (1i64 << 24) as f64 / (21.3 * sample_rate) + 0.5) as i32;
+        PITCHENV_UNIT = match sample_rate {
+            // N * (1<<24) / (21.3 * 48000) + 0.5 = 1049
+            48000 => 1049,
+            // N * (1<<24) / (21.3 * 44100) + 0.5 = 1143
+            _ => 1143,
+        };
     }
 }
 

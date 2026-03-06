@@ -158,7 +158,7 @@ fn load_patches(args: &Args) -> Vec<DxVoice> {
 
 fn render_wav(output_path: &str, patch: &DxVoice, args: &Args) {
     let sample_rate = args.sample_rate;
-    let mut synth = dx7_core::Synth::new(sample_rate as f64);
+    let mut synth = dx7_core::Synth::new(sample_rate);
     synth.load_patch(patch.clone());
 
     let note_samples = (args.duration * sample_rate as f64) as usize;
@@ -595,7 +595,7 @@ fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches
     // sustain pedal can exceed the DX7's original 16-voice limit).
     let mut synths: Vec<dx7_core::Synth> = (0..16)
         .map(|_| {
-            let mut s = dx7_core::Synth::with_max_voices(sample_rate as f64, 64);
+            let mut s = dx7_core::Synth::with_max_voices(sample_rate, 64);
             s.load_patch(patch.clone());
             s.set_master_volume(0.05);
             s
