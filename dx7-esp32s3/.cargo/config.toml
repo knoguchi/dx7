@@ -1,0 +1,16 @@
+[target.xtensa-esp32s3-none-elf]
+runner = "espflash flash --monitor"
+linker = "/home/kenji/.rustup/toolchains/esp/xtensa-esp-elf/esp-15.2.0_20250920/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
+
+[build]
+rustflags = [
+    "-C", "link-arg=-nostartfiles",
+    "-C", "link-arg=-Tlinkall.x",
+    "--remap-path-prefix", "/home/kenji/p/dx7=dx7",
+    "--remap-path-prefix", "/home/kenji/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f=crates",
+    "--remap-path-prefix", "/home/kenji/.rustup=rustup",
+]
+target = "xtensa-esp32s3-none-elf"
+
+[unstable]
+build-std = ["core", "alloc"]

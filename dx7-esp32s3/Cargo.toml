@@ -1,0 +1,26 @@
+[package]
+name = "dx7-esp32s3"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dx7-core = { path = "../dx7-core", default-features = false }
+esp-hal = { version = "1.0.0", features = ["esp32s3", "unstable"] }
+esp-println = { version = "0.16", default-features = false, features = ["esp32s3", "uart"] }
+esp-backtrace = { version = "0.18", features = ["esp32s3", "panic-handler", "println"] }
+esp-alloc = "0.9"
+xtensa-lx = "0.13"
+
+[features]
+qemu = []
+pwm = []
+es8311 = []
+
+[patch.crates-io]
+esp-rom-sys = { path = "/tmp/esp-rom-sys-patched" }
+esp-sync = { path = "/tmp/esp-sync-patched" }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
