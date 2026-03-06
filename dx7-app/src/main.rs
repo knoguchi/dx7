@@ -946,6 +946,7 @@ fn run_interactive(initial_patch: DxVoice, patches: Vec<DxVoice>, args: &Args) {
 
     println!("Audio: {} Hz", engine.sample_rate);
 
+
     // Try to connect MIDI using the shared command channel
     let midi_handler = match midi::MidiHandler::connect(
         args.midi_port.as_deref(),

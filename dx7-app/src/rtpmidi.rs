@@ -28,16 +28,20 @@ const CMD_CK: [u8; 2] = *b"CK"; // Clock sync
 const OUR_SSRC: u32 = 0xDEAD_D707;
 
 /// Handle to the running RTP-MIDI listener.
-/// Dropping this stops the listener thread and removes the mDNS advertisement.
+/// Dropping this stops the listener thread and kills the mDNS advertisement.
 pub struct RtpMidiHandler {
     _thread: std::thread::JoinHandle<()>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    _mdns_child: Option<std::process::Child>,
 }
 
 impl Drop for RtpMidiHandler {
     fn drop(&mut self) {
         self.shutdown
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(ref mut child) = self._mdns_child {
+            let _ = child.kill();
+        }
     }
 }
 
@@ -53,55 +57,72 @@ impl RtpMidiHandler {
         let shutdown2 = shutdown.clone();
 
         // Bind both UDP sockets before spawning (fail early)
-        let ctrl_sock = UdpSocket::bind(("0.0.0.0", control_port))
+        // Bind to IPv6 dual-stack (accepts both IPv4 and IPv6 on Linux)
+        let ctrl_sock = UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, control_port))
+            .or_else(|_| UdpSocket::bind(("0.0.0.0", control_port)))
             .map_err(|e| format!("Failed to bind control port {control_port}: {e}"))?;
-        let data_sock = UdpSocket::bind(("0.0.0.0", data_port))
+        let data_sock = UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, data_port))
+            .or_else(|_| UdpSocket::bind(("0.0.0.0", data_port)))
             .map_err(|e| format!("Failed to bind data port {data_port}: {e}"))?;
 
-        // Non-blocking so we can check the shutdown flag
-        ctrl_sock
-            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
-            .ok();
-        data_sock
-            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
-            .ok();
+        // Non-blocking: we poll both sockets in a tight loop
+        ctrl_sock.set_nonblocking(true).ok();
+        data_sock.set_nonblocking(true).ok();
 
-        // Register mDNS service
-        let mdns = mdns_sd::ServiceDaemon::new()
-            .map_err(|e| format!("Failed to start mDNS daemon: {e}"))?;
-        let service_info = mdns_sd::ServiceInfo::new(
-            "_apple-midi._udp.local.",
-            "DX7",
-            &format!(
-                "{}.local.",
-                hostname::get()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string()
-            ),
-            "",
-            control_port,
-            None,
-        )
-        .map_err(|e| format!("Failed to create mDNS service: {e}"))?;
-
-        mdns.register(service_info.clone())
-            .map_err(|e| format!("Failed to register mDNS service: {e}"))?;
+        // Register mDNS service via OS tool (avahi-publish on Linux, dns-sd on macOS).
+        // This avoids conflicts with the system mDNS daemon.
+        let mdns_child = register_mdns("DX7", control_port);
+        if mdns_child.is_none() {
+            eprintln!("RTP-MIDI: mDNS registration failed (install avahi-utils on Linux)");
+        }
 
         let handle = std::thread::Builder::new()
             .name("rtp-midi".into())
             .spawn(move || {
                 run_listener(ctrl_sock, data_sock, command_tx, &shutdown2);
-                // Unregister mDNS on shutdown
-                let _ = mdns.unregister(service_info.get_fullname());
-                let _ = mdns.shutdown();
             })
             .map_err(|e| format!("Failed to spawn RTP-MIDI thread: {e}"))?;
 
         Ok(RtpMidiHandler {
             _thread: handle,
             shutdown,
+            _mdns_child: mdns_child,
         })
+    }
+}
+
+/// Register the RTP-MIDI service via the OS mDNS daemon.
+/// Returns a child process handle that must be kept alive.
+fn register_mdns(name: &str, port: u16) -> Option<std::process::Child> {
+    use std::process::{Command, Stdio};
+    let port_str = port.to_string();
+
+    // Linux: avahi-publish-service
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("avahi-publish-service")
+            .args([name, "_apple-midi._udp", &port_str])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()
+    }
+
+    // macOS: dns-sd -R
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("dns-sd")
+            .args(["-R", name, "_apple-midi._udp", "local", &port_str])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (name, port_str);
+        None
     }
 }
 
@@ -117,8 +138,11 @@ fn run_listener(
     let epoch = Instant::now();
 
     while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut got_data = false;
+
         // Poll control socket (invitations, sync, bye)
         if let Ok((n, addr)) = ctrl_sock.recv_from(&mut ctrl_buf) {
+            got_data = true;
             if n >= 4 && ctrl_buf[..2] == SIGNATURE {
                 handle_session_packet(&ctrl_buf[2..n], &ctrl_sock, addr, epoch);
             }
@@ -126,6 +150,7 @@ fn run_listener(
 
         // Poll data socket (invitations on data port + RTP MIDI)
         if let Ok((n, addr)) = data_sock.recv_from(&mut data_buf) {
+            got_data = true;
             if n >= 4 && data_buf[..2] == SIGNATURE {
                 // Session packet on data port (invitation step 2, sync, etc.)
                 handle_session_packet(&data_buf[2..n], &data_sock, addr, epoch);
@@ -139,6 +164,11 @@ fn run_listener(
                     }
                 }
             }
+        }
+
+        // Sleep only when idle to avoid burning CPU
+        if !got_data {
+            std::thread::sleep(std::time::Duration::from_micros(500));
         }
     }
 }
@@ -156,26 +186,27 @@ fn handle_session_packet(
 
     let cmd = [data[0], data[1]];
 
+
     match cmd {
         CMD_IN => handle_invitation(data, sock, addr),
         CMD_CK => handle_sync(data, sock, addr, epoch),
         CMD_BY => {
             eprintln!("RTP-MIDI: session ended by remote");
         }
-        _ => {} // OK, NO, RS, RL — we don't initiate, so ignore
+        _ => {}
     }
 }
 
 /// Accept an invitation: reply with OK using the same initiator token.
 fn handle_invitation(data: &[u8], sock: &UdpSocket, addr: std::net::SocketAddr) {
-    // data: [IN(2)] [version(2)] [token(4)] [ssrc(4)] [name...]
-    if data.len() < 12 {
+    // data: [IN(2)] [version(4)] [token(4)] [ssrc(4)] [name...]
+    if data.len() < 14 {
         return;
     }
 
-    let token = &data[4..8];
-    let remote_name = if data.len() > 12 {
-        std::str::from_utf8(&data[12..])
+    let token = &data[6..10];
+    let remote_name = if data.len() > 14 {
+        std::str::from_utf8(&data[14..])
             .unwrap_or("?")
             .trim_end_matches('\0')
     } else {
@@ -205,7 +236,8 @@ fn handle_sync(
     epoch: Instant,
 ) {
     // data: [CK(2)] [ssrc(4)] [count(1)] [padding(3)] [ts1(8)] [ts2(8)] [ts3(8)]
-    if data.len() < 36 {
+    // Total: 34 bytes (ts3 may be zero-filled for count=0)
+    if data.len() < 34 {
         return;
     }
 
