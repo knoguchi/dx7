@@ -1,6 +1,6 @@
-# dx7-rpi — DX7 FM Synth on Raspberry Pi Pico 2 W
+# dx7-rp2350 — DX7 FM Synth on RP2350
 
-DX7 FM synthesizer running on the RP2350 (Cortex-M33 @ 150 MHz).
+DX7 FM synthesizer running on the RP2350 (Cortex-M33 @ 200 MHz, dual-core).
 
 ## Prerequisites
 
@@ -16,7 +16,7 @@ cargo install elf2uf2-rs       # UF2 drag-and-drop
 ## Build
 
 ```bash
-cd dx7-rpi
+cd dx7-rp2350
 
 # Benchmark only (no audio)
 cargo build --release
@@ -33,14 +33,21 @@ cargo build --release --features "usb-midi,pwm"
 ### Via debug probe (SWD)
 
 ```bash
-probe-rs run --chip RP2350 target/thumbv8m.main-none-eabihf/release/dx7-rpi
+probe-rs run --chip RP2350 target/thumbv8m.main-none-eabihf/release/dx7-rp2350
 ```
 
 ### Via UF2 (hold BOOTSEL + plug USB)
 
 ```bash
-elf2uf2-rs target/thumbv8m.main-none-eabihf/release/dx7-rpi dx7-rpi.uf2
-# Copy dx7-rpi.uf2 to the RPI-RP2 USB drive
+elf2uf2-rs target/thumbv8m.main-none-eabihf/release/dx7-rp2350 dx7-rp2350.uf2
+# Copy dx7-rp2350.uf2 to the RPI-RP2 USB drive
+```
+
+### Via picotool
+
+```bash
+picotool load target/thumbv8m.main-none-eabihf/release/dx7-rp2350 -t elf -f
+picotool reboot
 ```
 
 ## Features
@@ -56,6 +63,12 @@ elf2uf2-rs target/thumbv8m.main-none-eabihf/release/dx7-rpi dx7-rpi.uf2
 Typical combinations:
 - `--features pwm` — demo playback, no MIDI
 - `--features "usb-midi,pwm"` — live synth, plug into DAW
+
+## Architecture
+
+Dual-core rendering with 4-voice polyphony:
+- **Core 0**: embassy async — USB MIDI + renders voices 0-1 + pushes to ring buffer
+- **Core 1**: TIMER0 ALARM3 ISR at 48kHz for PWM output + renders voices 2-3 on demand
 
 ## Pin Mapping
 
@@ -84,7 +97,7 @@ Cutoff frequency: ~1.6 kHz (adequate for demo; use I2S + DAC for quality audio).
 
 ## Performance
 
-- RP2350: 150 MHz Cortex-M33, 520 KB SRAM
+- RP2350: 200 MHz Cortex-M33, 520 KB SRAM
 - Block size: 64 samples @ 48 kHz = 1333 us deadline
-- Expected: ~30-35k cycles/voice → 5-6 voices per core
-- Dual-core (future): 10-12 voices
+- ~25% CPU per voice per core
+- 4 voices across 2 cores at ~50% utilization each

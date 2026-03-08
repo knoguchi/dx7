@@ -1,4 +1,4 @@
 [workspace]
 members = ["dx7-core", "dx7-app", "dx7-midi"]
-exclude = ["dx7-esp32s3", "dx7-rpi"]
+exclude = ["dx7-esp32s3", "dx7-rp2350"]
 resolver = "2"

@@ -348,7 +348,7 @@ name = "dx7-midi"
 version = "0.1.0"
 
 [[package]]
-name = "dx7-rpi"
+name = "dx7-rp2350"
 version = "0.1.0"
 dependencies = [
  "cortex-m",
