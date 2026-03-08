@@ -2,16 +2,14 @@
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Keyboard handler that maps computer keys to MIDI notes.
 pub struct KeyboardHandler {
     /// Map from KeyCode to MIDI note number
     key_map: HashMap<KeyCode, u8>,
     /// Track which keys are currently held
-    held_keys: HashMap<KeyCode, Instant>,
-    /// Debounce duration to defeat OS auto-repeat
-    debounce: Duration,
+    held_keys: HashMap<KeyCode, u8>, // KeyCode -> MIDI note
     /// Current octave offset
     octave: i8,
 }
@@ -44,7 +42,6 @@ impl KeyboardHandler {
         KeyboardHandler {
             key_map,
             held_keys: HashMap::new(),
-            debounce: Duration::from_millis(30),
             octave: 0,
         }
     }
@@ -96,24 +93,20 @@ impl KeyboardHandler {
 
                 // Musical key handling
                 if let Some(&base_note) = self.key_map.get(&key.code) {
-                    let now = Instant::now();
+                    let note = (base_note as i8 + self.octave * 12).clamp(0, 127) as u8;
 
-                    // Debounce: ignore if key was recently released (OS auto-repeat)
-                    if let Some(last) = self.held_keys.get(&key.code) {
-                        if now.duration_since(*last) < self.debounce {
-                            return events;
-                        }
+                    if self.held_keys.contains_key(&key.code) {
+                        // Already held — auto-repeat. Send NoteOff + NoteOn to
+                        // retrigger instead of stacking voices.
+                        events.push(KeyboardEvent::NoteOff(note));
                     }
 
-                    let note = (base_note as i8 + self.octave * 12).clamp(0, 127) as u8;
-                    self.held_keys.insert(key.code, now);
+                    self.held_keys.insert(key.code, note);
                     events.push(KeyboardEvent::NoteOn(note, 100));
                 }
             }
             KeyEventKind::Release => {
-                if let Some(&base_note) = self.key_map.get(&key.code) {
-                    self.held_keys.remove(&key.code);
-                    let note = (base_note as i8 + self.octave * 12).clamp(0, 127) as u8;
+                if let Some(note) = self.held_keys.remove(&key.code) {
                     events.push(KeyboardEvent::NoteOff(note));
                 }
             }
@@ -122,7 +115,6 @@ impl KeyboardHandler {
 
         events
     }
-
 }
 
 /// Events produced by the keyboard handler.

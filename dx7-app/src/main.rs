@@ -20,6 +20,7 @@ use clap::Parser;
 use crossterm::terminal;
 use dx7_core::{get_rom1a_preset, DxVoice, SynthCommand};
 use std::time::Duration;
+use std::io::Write;
 
 #[derive(Parser, Debug)]
 #[command(name = "dx7", about = "DX7 FM Synthesizer Emulator")]
@@ -946,6 +947,7 @@ fn run_interactive(initial_patch: DxVoice, patches: Vec<DxVoice>, args: &Args) {
 
     println!("Audio: {} Hz", engine.sample_rate);
 
+
     // Try to connect MIDI using the shared command channel
     let midi_handler = match midi::MidiHandler::connect(
         args.midi_port.as_deref(),
@@ -1034,6 +1036,7 @@ fn run_interactive(initial_patch: DxVoice, patches: Vec<DxVoice>, args: &Args) {
                         let name = patch.name_str().to_string();
                         engine.send_command(SynthCommand::LoadPatch(Box::new(patch)));
                         print!("\r\x1b[K  Patch {}: {}\r", idx, name);
+                        std::io::stdout().flush().unwrap();
                     }
                 }
                 keyboard::KeyboardEvent::Quit => {

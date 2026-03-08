@@ -31,6 +31,9 @@ pub struct Synth {
     mod_wheel: i32,
     /// Internal scratch buffer for mixing (one N-sample block).
     mix_buffer: [i32; N],
+    /// Residue buffer for sub-block alignment in render (stereo).
+    stereo_residue: [f32; N * 2],
+    stereo_residue_len: usize, // in frames (not samples)
     /// Residue buffer for sub-block alignment in render_mono.
     /// Voices always advance by N samples per block; when the caller
     /// requests a non-N-aligned number of frames, we buffer the
@@ -66,6 +69,8 @@ impl Synth {
             pitch_bend_logfreq: 0,
             mod_wheel: 0,
             mix_buffer: [0i32; N],
+            stereo_residue: [0.0; N * 2],
+            stereo_residue_len: 0,
             mono_residue: [0.0; N],
             mono_residue_len: 0,
         }
@@ -192,34 +197,49 @@ impl Synth {
     }
 
     /// Render audio into the output buffer (interleaved stereo f32, -1.0..1.0).
+    /// Handles non-N-aligned buffer sizes by buffering residue samples
+    /// so voices always advance in exact N-sample blocks.
     pub fn render(&mut self, output: &mut [f32]) {
         let channels = 2;
         let total_frames = output.len() / channels;
         let mut frame_offset = 0;
 
-        while frame_offset < total_frames {
-            let block_frames = (total_frames - frame_offset).min(N);
+        // First, drain any residue from a previous partial block
+        if self.stereo_residue_len > 0 {
+            let to_copy = self.stereo_residue_len.min(total_frames);
+            let src = &self.stereo_residue[..to_copy * channels];
+            output[..to_copy * channels].copy_from_slice(src);
+            if to_copy < self.stereo_residue_len {
+                let rem = self.stereo_residue_len - to_copy;
+                self.stereo_residue.copy_within(to_copy * channels..self.stereo_residue_len * channels, 0);
+                self.stereo_residue_len = rem;
+                return;
+            }
+            self.stereo_residue_len = 0;
+            frame_offset = to_copy;
+        }
 
-            // Clear mix buffer
+        let volume = self.master_volume * self.expression;
+
+        while frame_offset < total_frames {
+            // Always render a full N-sample block
             self.mix_buffer = [0i32; N];
 
-            // Render all active voices into mix buffer
             for voice in &mut self.voices {
                 if voice.state != VoiceState::Inactive {
                     voice.pitch_bend = self.pitch_bend_logfreq;
                     voice.mod_wheel = self.mod_wheel;
                     let mut voice_buf = [0i32; N];
                     voice.render(&mut voice_buf);
-                    for i in 0..block_frames {
+                    for i in 0..N {
                         self.mix_buffer[i] += voice_buf[i] >> 4;
                     }
                 }
             }
 
-            // Convert i32 mix to f32 stereo output
-            // Matches Dexed: val >> 4 (done above), clip at ±(1<<24), >> 9, /32768
-            let volume = self.master_volume * self.expression;
-            for i in 0..block_frames {
+            // Convert full block to f32 stereo
+            let mut block_stereo = [0.0f32; N * 2];
+            for i in 0..N {
                 let val = self.mix_buffer[i];
                 let clip_val: i32 = if val < -(1 << 24) {
                     -0x8000
@@ -230,12 +250,25 @@ impl Synth {
                 };
                 let sample_f32 = (clip_val as f32 / 0x8000 as f32) * volume;
                 let clamped = sample_f32.clamp(-1.0, 1.0);
-                let out_idx = (frame_offset + i) * channels;
-                output[out_idx] = clamped;
-                output[out_idx + 1] = clamped;
+                block_stereo[i * 2] = clamped;
+                block_stereo[i * 2 + 1] = clamped;
             }
 
-            frame_offset += block_frames;
+            let remaining = total_frames - frame_offset;
+            if remaining >= N {
+                let out_start = frame_offset * channels;
+                output[out_start..out_start + N * channels]
+                    .copy_from_slice(&block_stereo);
+                frame_offset += N;
+            } else {
+                let out_start = frame_offset * channels;
+                output[out_start..].copy_from_slice(&block_stereo[..remaining * channels]);
+                let residue_frames = N - remaining;
+                self.stereo_residue[..residue_frames * channels]
+                    .copy_from_slice(&block_stereo[remaining * channels..]);
+                self.stereo_residue_len = residue_frames;
+                frame_offset = total_frames;
+            }
         }
     }
 
