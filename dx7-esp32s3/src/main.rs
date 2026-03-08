@@ -13,9 +13,6 @@ use dx7_core::tables::N;
 #[cfg(feature = "es8311")]
 mod es8311;
 
-#[cfg(feature = "ble-midi")]
-mod ble_midi;
-
 const SAMPLE_RATE: u32 = 48000;
 const CPU_HZ: u32 = 240_000_000;
 #[cfg(not(feature = "ble-midi"))]
@@ -136,7 +133,7 @@ async fn ble_midi_synth(bluetooth: esp_hal::peripherals::BT<'static>) -> ! {
     use trouble_host::prelude::*;
     use esp_radio::ble::controller::BleConnector;
 
-    static MIDI_QUEUE: ble_midi::MidiQueue = ble_midi::MidiQueue::new();
+    static MIDI_QUEUE: dx7_midi::MidiQueue = dx7_midi::MidiQueue::new();
 
     println!("Initializing BLE...");
 
@@ -208,7 +205,7 @@ async fn ble_midi_synth(bluetooth: esp_hal::peripherals::BT<'static>) -> ! {
                         match event {
                             GattEvent::Write(write_evt) => {
                                 let data = write_evt.data();
-                                ble_midi::parse_ble_midi_packet(data, &MIDI_QUEUE);
+                                dx7_midi::ble::parse_ble_midi_packet(data, &MIDI_QUEUE);
                                 let _ = write_evt.accept();
                             }
                             other => { let _ = other.accept(); }
@@ -225,18 +222,19 @@ async fn ble_midi_synth(bluetooth: esp_hal::peripherals::BT<'static>) -> ! {
             // Process MIDI
             while let Some(msg) = MIDI_QUEUE.pop() {
                 match msg {
-                    ble_midi::MidiMessage::NoteOn { note, velocity } => {
+                    dx7_midi::MidiMessage::NoteOn { note, velocity } => {
                         voice.note_on(&current_patch, note, velocity);
                     }
-                    ble_midi::MidiMessage::NoteOff { .. } => {
+                    dx7_midi::MidiMessage::NoteOff { .. } => {
                         voice.note_off();
                     }
-                    ble_midi::MidiMessage::ProgramChange { program } => {
+                    dx7_midi::MidiMessage::ProgramChange { program } => {
                         if let Some(p) = load_rom1a_voice(program as usize) {
                             current_patch = p;
                         }
                     }
-                    ble_midi::MidiMessage::ControlChange { .. } => {}
+                    dx7_midi::MidiMessage::ControlChange { .. } => {}
+                    _ => {}
                 }
             }
 

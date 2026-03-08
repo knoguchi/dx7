@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 dx7-core = { path = "../dx7-core", default-features = false }
+dx7-midi = { path = "../dx7-midi" }
 esp-hal = { version = "1.0.0", features = ["esp32s3", "unstable"] }
 esp-println = { version = "0.16", default-features = false, features = ["esp32s3", "uart"] }
 esp-backtrace = { version = "0.18", features = ["esp32s3", "panic-handler", "println"] }

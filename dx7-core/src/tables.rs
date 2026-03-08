@@ -34,24 +34,35 @@ static mut SR_MULTIPLIER: u32 = 1 << 24;
 /// Pointer to the active FREQLUT (selected by sample rate at init).
 static mut FREQLUT: *const i32 = core::ptr::null();
 
+/// RAM-resident copies of hot lookup tables (copied from flash at init).
+/// On embedded targets, flash XIP cache misses make const table lookups slow.
+static mut SINLOG_RAM: [u16; 1024] = [0; 1024];
+static mut SINEXP_RAM: [u16; 1024] = [0; 1024];
+static mut FREQLUT_RAM: [i32; 1025] = [0; 1025];
+
 /// Initialize all lookup tables. Must be called once at startup before any
 /// audio rendering. Not thread-safe — call from a single thread.
 ///
 /// Only 44100 and 48000 Hz are supported.
 pub fn init_tables(sample_rate: u32) {
     unsafe {
+        // Copy hot tables to RAM for fast access on embedded targets
+        SINLOG_RAM.copy_from_slice(&generated_tables::SINLOG_TABLE);
+        SINEXP_RAM.copy_from_slice(&generated_tables::SINEXP_TABLE);
+
         match sample_rate {
             48000 => {
-                FREQLUT = generated_tables::FREQLUT_48000.as_ptr();
+                FREQLUT_RAM.copy_from_slice(&generated_tables::FREQLUT_48000);
                 // (44100 / 48000) * (1 << 24) = 15420469
                 SR_MULTIPLIER = 15420469;
             }
             _ => {
                 // Default to 44100
-                FREQLUT = generated_tables::FREQLUT_44100.as_ptr();
+                FREQLUT_RAM.copy_from_slice(&generated_tables::FREQLUT_44100);
                 SR_MULTIPLIER = 1 << 24;
             }
         }
+        FREQLUT = FREQLUT_RAM.as_ptr();
     }
 }
 
@@ -126,18 +137,20 @@ pub fn freqlut_lookup(logfreq: i32) -> i32 {
 #[inline]
 pub fn sin_log(phi: u16) -> u16 {
     let index = (phi & 0x3FF) as usize;
-    match (phi >> 10) & 3 {
-        0 => generated_tables::SINLOG_TABLE[index],
-        1 => generated_tables::SINLOG_TABLE[index ^ 0x3FF],
-        2 => generated_tables::SINLOG_TABLE[index] | 0x8000,
-        _ => generated_tables::SINLOG_TABLE[index ^ 0x3FF] | 0x8000,
+    unsafe {
+        match (phi >> 10) & 3 {
+            0 => SINLOG_RAM[index],
+            1 => SINLOG_RAM[index ^ 0x3FF],
+            2 => SINLOG_RAM[index] | 0x8000,
+            _ => SINLOG_RAM[index ^ 0x3FF] | 0x8000,
+        }
     }
 }
 
 /// Exp table lookup for MkI. Returns mantissa value (0..4095).
 #[inline]
 pub fn sin_exp(index: u16) -> u16 {
-    generated_tables::SINEXP_TABLE[(index & 0x3FF) as usize]
+    unsafe { SINEXP_RAM[(index & 0x3FF) as usize] }
 }
 
 /// Convert MIDI note number to Q24 logfreq (standard 12-TET, A4=440Hz).
