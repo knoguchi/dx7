@@ -1,5 +1,7 @@
 [target.thumbv8m.main-none-eabihf]
-runner = "probe-rs run --chip RP2350"
+# runner = "probe-rs run --chip RP2350"
+runner = "./uf2-deploy"
+rustflags = ["-C", "target-cpu=cortex-m33"]
 
 [build]
 target = "thumbv8m.main-none-eabihf"

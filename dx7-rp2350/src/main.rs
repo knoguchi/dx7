@@ -12,7 +12,7 @@ use dx7_core::voice::{Voice, VoiceState};
 use dx7_core::load_rom1a_voice;
 use dx7_core::tables::N;
 
-const MAX_VOICES: usize = 4;
+const MAX_VOICES: usize = 6;
 
 const SAMPLE_RATE: u32 = 48000;
 const CPU_HZ: u32 = 200_000_000;
@@ -32,6 +32,127 @@ fn init_heap() {
     unsafe {
         HEAP.init(HEAP_MEM.as_mut_ptr() as usize, HEAP_SIZE);
     }
+}
+
+// --- f32 output filters (DC blocker + 4th-order Butterworth LPF) ---
+
+/// Biquad (2nd-order IIR) filter using f32 single-precision FPU.
+/// Direct Form I: y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2] - a1*y[n-1] - a2*y[n-2]
+struct BiquadF32 {
+    b0: f32, b1: f32, b2: f32,
+    a1: f32, a2: f32,
+    x1: f32, x2: f32, // input delay
+    y1: f32, y2: f32, // output delay
+}
+
+impl BiquadF32 {
+    const fn new(b0: f32, b1: f32, b2: f32, a1: f32, a2: f32) -> Self {
+        Self { b0, b1, b2, a1, a2, x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0 }
+    }
+
+    #[inline(always)]
+    fn process(&mut self, x: f32) -> f32 {
+        let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
+              - self.a1 * self.y1 - self.a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = x;
+        self.y2 = self.y1;
+        self.y1 = y;
+        y
+    }
+}
+
+/// DC-blocking high-pass filter (1st-order, ~5Hz cutoff at 48kHz).
+/// y[n] = x[n] - x[n-1] + r * y[n-1], where r ≈ 0.9993455
+struct DcBlockerF32 {
+    r: f32,
+    x1: f32,
+    y1: f32,
+}
+
+impl DcBlockerF32 {
+    const fn new(r: f32) -> Self {
+        Self { r, x1: 0.0, y1: 0.0 }
+    }
+
+    #[inline(always)]
+    fn process(&mut self, x: f32) -> f32 {
+        let y = x - self.x1 + self.r * self.y1;
+        self.x1 = x;
+        self.y1 = y;
+        y
+    }
+}
+
+/// Output filter chain: DC blocker → 4th-order Butterworth LPF at 10.5kHz.
+/// Removes DC offset from asymmetric FM and aliases above Nyquist/2.
+struct OutputFilterF32 {
+    dc1: DcBlockerF32,
+    dc2: DcBlockerF32,
+    lpf1: BiquadF32, // Stage 1 (Q=0.5412)
+    lpf2: BiquadF32, // Stage 2 (Q=1.3066)
+}
+
+impl OutputFilterF32 {
+    fn new() -> Self {
+        // Coefficients for 4th-order Butterworth LPF at 10500 Hz / 48000 Hz
+        Self {
+            dc1: DcBlockerF32::new(0.9993455),
+            dc2: DcBlockerF32::new(0.9993455),
+            // Stage 1 (Q=0.5412)
+            lpf1: BiquadF32::new(
+                0.21113742, 0.42227485, 0.21113742,
+                -0.20469809, 0.04924778,
+            ),
+            // Stage 2 (Q=1.3066)
+            lpf2: BiquadF32::new(
+                0.29262414, 0.58524828, 0.29262414,
+                -0.28369960, 0.45419615,
+            ),
+        }
+    }
+
+    #[inline(always)]
+    fn process(&mut self, x: f32) -> f32 {
+        let x = self.dc1.process(x);
+        let x = self.dc2.process(x);
+        let x = self.lpf1.process(x);
+        self.lpf2.process(x)
+    }
+}
+
+// --- Cortex-M33 DSP intrinsics ---
+
+/// Saturating 32-bit signed add (QADD instruction, 1 cycle).
+/// Clamps result to [i32::MIN, i32::MAX] instead of wrapping.
+#[inline(always)]
+fn qadd(a: i32, b: i32) -> i32 {
+    let result: i32;
+    unsafe {
+        core::arch::asm!(
+            "qadd {out}, {a}, {b}",
+            a = in(reg) a,
+            b = in(reg) b,
+            out = lateout(reg) result,
+        );
+    }
+    result
+}
+
+/// Unsigned saturate to N bits (USAT instruction, 1 cycle).
+/// Clamps signed i32 to [0, 2^N - 1].
+#[inline(always)]
+fn usat<const N: u32>(val: i32) -> u32 {
+    let result: u32;
+    unsafe {
+        core::arch::asm!(
+            "usat {out}, #{n}, {val}",
+            val = in(reg) val,
+            n = const N,
+            out = lateout(reg) result,
+        );
+    }
+    result
 }
 
 // --- DWT cycle counter (Cortex-M33) ---
@@ -217,14 +338,14 @@ mod mc_render {
             }
             RENDER_START.store(false, Ordering::Relaxed);
 
-            // Render voices 2..MAX_VOICES into CORE1_BUF
+            // Render voices MAX_VOICES/2..MAX_VOICES into CORE1_BUF
             CORE1_BUF.fill(0);
-            for idx in 2..MAX_VOICES {
+            for idx in (MAX_VOICES / 2)..MAX_VOICES {
                 if !voices[idx].is_finished() {
                     let mut buf = [0i32; N];
                     voices[idx].render(&mut buf);
                     for j in 0..N {
-                        CORE1_BUF[j] += buf[j];
+                        CORE1_BUF[j] = super::qadd(CORE1_BUF[j], buf[j]);
                     }
                 }
             }
@@ -343,7 +464,7 @@ fn pwm_demo(
         // Scale output to 10-bit PWM duty (0..1023)
         for i in 0..N {
             let duty = (output[i] >> 17) + 512;
-            duties[i] = duty.clamp(0, 1023) as u16;
+            duties[i] = usat::<10>(duty) as u16;
         }
         // Wait for space in ring buffer
         while audio_ring::free_slots() < N {
@@ -479,10 +600,20 @@ async fn usb_midi_pwm_synth(
 
     static MIDI_QUEUE: dx7_midi::MidiQueue = dx7_midi::MidiQueue::new();
 
+    // SysEx reception buffer (max 4104 bytes for DX7 32-voice bulk dump)
+    static mut SYSEX_RX_BUF: [u8; 4200] = [0u8; 4200];
+    static mut SYSEX_RX_POS: usize = 0;
+    static mut SYSEX_RX_ACTIVE: bool = false;
+
+    // SysEx voice bank storage (32 packed voices × 128 bytes)
+    static mut SYSEX_BANK: [u8; 4096] = [0u8; 4096];
+    static SYSEX_BANK_LOADED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
     // Task 1: USB device driver
     let usb_run = usb.run();
 
-    // Task 2: Read USB MIDI packets
+    // Task 2: Read USB MIDI packets (with SysEx accumulation)
     let midi_read = async {
         loop {
             receiver.wait_connection().await;
@@ -490,7 +621,81 @@ async fn usb_midi_pwm_synth(
             match receiver.read_packet(&mut buf).await {
                 Ok(n) => {
                     for chunk in buf[..n].chunks_exact(4) {
-                        dx7_midi::usb::parse_usb_midi_event(chunk, &MIDI_QUEUE);
+                        let cin = chunk[0] & 0x0F;
+                        match cin {
+                            0x04 => {
+                                // SysEx start or continue — 3 data bytes
+                                #[allow(static_mut_refs)]
+                                unsafe {
+                                    if chunk[1] == 0xF0 {
+                                        SYSEX_RX_POS = 0;
+                                        SYSEX_RX_ACTIVE = true;
+                                    }
+                                    if SYSEX_RX_ACTIVE {
+                                        for &b in &chunk[1..4] {
+                                            if SYSEX_RX_POS < SYSEX_RX_BUF.len() {
+                                                SYSEX_RX_BUF[SYSEX_RX_POS] = b;
+                                                SYSEX_RX_POS += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            0x05 | 0x06 | 0x07 => {
+                                // SysEx end: 1, 2, or 3 final bytes
+                                #[allow(static_mut_refs)]
+                                unsafe {
+                                    if SYSEX_RX_ACTIVE {
+                                        let count = (cin - 0x04) as usize; // 1, 2, or 3
+                                        for &b in &chunk[1..1 + count] {
+                                            if SYSEX_RX_POS < SYSEX_RX_BUF.len() {
+                                                SYSEX_RX_BUF[SYSEX_RX_POS] = b;
+                                                SYSEX_RX_POS += 1;
+                                            }
+                                        }
+                                        // Process complete SysEx
+                                        let len = SYSEX_RX_POS;
+                                        if len == 4104
+                                            && SYSEX_RX_BUF[0] == 0xF0
+                                            && SYSEX_RX_BUF[1] == 0x43
+                                            && (SYSEX_RX_BUF[2] & 0xF0) == 0x00
+                                            && SYSEX_RX_BUF[3] == 0x09
+                                            && SYSEX_RX_BUF[4] == 0x20
+                                            && SYSEX_RX_BUF[5] == 0x00
+                                            && SYSEX_RX_BUF[4103] == 0xF7
+                                        {
+                                            // DX7 32-voice bulk dump — verify checksum
+                                            let sum: u8 = SYSEX_RX_BUF[6..4102]
+                                                .iter()
+                                                .fold(0u8, |acc, &b| acc.wrapping_add(b));
+                                            let expected = (!sum).wrapping_add(1) & 0x7F;
+                                            if expected == SYSEX_RX_BUF[4102] {
+                                                SYSEX_BANK.copy_from_slice(
+                                                    &SYSEX_RX_BUF[6..4102],
+                                                );
+                                                SYSEX_BANK_LOADED.store(
+                                                    true,
+                                                    core::sync::atomic::Ordering::Release,
+                                                );
+                                                info!("SysEx: loaded 32-voice bank");
+                                            } else {
+                                                info!(
+                                                    "SysEx: checksum mismatch ({} vs {})",
+                                                    expected, SYSEX_RX_BUF[4102]
+                                                );
+                                            }
+                                        } else if len > 0 {
+                                            info!("SysEx: ignored ({} bytes)", len);
+                                        }
+                                        SYSEX_RX_ACTIVE = false;
+                                    }
+                                }
+                            }
+                            _ => {
+                                // Regular MIDI message
+                                dx7_midi::usb::parse_usb_midi_event(chunk, &MIDI_QUEUE);
+                            }
+                        }
                     }
                 }
                 Err(_) => continue,
@@ -509,6 +714,24 @@ async fn usb_midi_pwm_synth(
         let mut current_patch = load_rom1a_voice(0).unwrap();
         let mut output = [0i32; N];
         let mut duties = [0u16; N];
+        // Static to avoid async stack pressure (~96 bytes)
+        static mut FILTER: OutputFilterF32 = OutputFilterF32 {
+            dc1: DcBlockerF32 { r: 0.9993455, x1: 0.0, y1: 0.0 },
+            dc2: DcBlockerF32 { r: 0.9993455, x1: 0.0, y1: 0.0 },
+            // 4th-order Butterworth LPF at 10500 Hz / 48000 Hz
+            lpf1: BiquadF32 {
+                b0: 0.21113742, b1: 0.42227485, b2: 0.21113742,
+                a1: -0.20469809, a2: 0.04924778,
+                x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0,
+            },
+            lpf2: BiquadF32 {
+                b0: 0.29262414, b1: 0.58524828, b2: 0.29262414,
+                a1: -0.28369960, a2: 0.45419615,
+                x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0,
+            },
+        };
+        #[allow(static_mut_refs)]
+        let filter = unsafe { &mut FILTER };
 
         // CPU utilization tracking
         let budget_cycles = (N as u32 * CPU_HZ) / SAMPLE_RATE;
@@ -550,7 +773,27 @@ async fn usb_midi_pwm_synth(
                         }
                     }
                     dx7_midi::MidiMessage::ProgramChange { program } => {
-                        if let Some(p) = load_rom1a_voice(program as usize) {
+                        if program == 32 {
+                            // Pure sine test patch (INIT VOICE)
+                            current_patch = dx7_core::DxVoice::init_voice();
+                        } else if SYSEX_BANK_LOADED.load(core::sync::atomic::Ordering::Acquire)
+                        {
+                            // Load from received SysEx bank
+                            let idx = program as usize;
+                            if idx < 32 {
+                                let start = idx * 128;
+                                let mut voice_data = [0u8; 128];
+                                #[allow(static_mut_refs)]
+                                unsafe {
+                                    voice_data.copy_from_slice(
+                                        &SYSEX_BANK[start..start + 128],
+                                    );
+                                }
+                                current_patch =
+                                    dx7_core::DxVoice::from_packed(&voice_data);
+                                info!("Loaded sysex patch {}", idx);
+                            }
+                        } else if let Some(p) = load_rom1a_voice(program as usize) {
                             current_patch = p;
                         }
                     }
@@ -563,15 +806,15 @@ async fn usb_midi_pwm_synth(
             mc_render::RENDER_DONE.store(false, core::sync::atomic::Ordering::Relaxed);
             mc_render::RENDER_START.store(true, core::sync::atomic::Ordering::Release);
 
-            // Render voices 0..2 on core 0
+            // Render voices 0..MAX_VOICES/2 on core 0
             output.fill(0);
             let render_start = read_cycles();
-            for idx in 0..2 {
+            for idx in 0..(MAX_VOICES / 2) {
                 if !voices[idx].is_finished() {
                     let mut voice_buf = [0i32; N];
                     voices[idx].render(&mut voice_buf);
                     for i in 0..N {
-                        output[i] += voice_buf[i];
+                        output[i] = qadd(output[i], voice_buf[i]);
                     }
                 }
             }
@@ -585,22 +828,36 @@ async fn usb_midi_pwm_synth(
             // Combine core 1's rendered output
             #[allow(static_mut_refs)]
             for i in 0..N {
-                output[i] += unsafe { mc_render::CORE1_BUF[i] };
+                output[i] = qadd(output[i], unsafe { mc_render::CORE1_BUF[i] });
             }
 
             if render_cycles > peak_cycles {
                 peak_cycles = render_cycles;
             }
 
-            // Scale output to 10-bit PWM duty (0..1023) and track peaks
+            // Convert to f32, apply DC blocker + LPF, then scale to 10-bit PWM duty
             for i in 0..N {
                 let raw_abs = output[i].abs();
                 if raw_abs > peak_raw {
                     peak_raw = raw_abs;
                 }
-                // >>18 maps ±2^26 (1 voice) to ±256; 4 voices can clip but rarely peak together
-                let duty = (output[i] >> 18) + 512;
-                duties[i] = duty.clamp(0, 1023) as u16;
+                // Convert i32 to f32. Single voice peaks ±2^26.
+                // Divide by 2^26 * 2 — loud enough for typical playing,
+                // soft-clip handles occasional peaks from dense chords.
+                let sample_f32 = output[i] as f32 / (67108864.0 * 2.0);
+                let filtered = filter.process(sample_f32);
+                // Soft clip: tanh approximation (smooth limiting, no harsh distortion)
+                let x = filtered;
+                let soft = if x > 1.0 {
+                    1.0
+                } else if x < -1.0 {
+                    -1.0
+                } else {
+                    x * (27.0 + x * x) / (27.0 + 9.0 * x * x)
+                };
+                // Scale to 10-bit PWM: ±1.0 → ±512, center at 512
+                let duty = (soft * 512.0 + 512.5) as i32;
+                duties[i] = usat::<10>(duty) as u16;
                 let off = if duties[i] >= 512 { duties[i] - 512 } else { 512 - duties[i] };
                 if off > peak_duty_off {
                     peak_duty_off = off;

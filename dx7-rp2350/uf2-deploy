@@ -1,0 +1,37 @@
+#!/bin/sh
+# UF2 deploy runner for RP2350 (Pico 2).
+# Used as cargo runner: receives ELF binary path as $1.
+# Converts to UF2 with correct RP2350 ARM-S family ID and copies to BOOTSEL volume.
+set -e
+
+ELF="$1"
+UF2="/tmp/dx7-rp2350.uf2"
+VOLUME="/Volumes/RP2350"
+
+if [ -z "$ELF" ]; then
+    echo "Usage: $0 <elf-binary>" >&2
+    exit 1
+fi
+
+if [ ! -f "$ELF" ]; then
+    echo "Error: ELF not found: $ELF" >&2
+    exit 1
+fi
+
+# picotool requires .elf extension
+TMP_ELF="/tmp/dx7-rp2350.elf"
+cp "$ELF" "$TMP_ELF"
+
+picotool uf2 convert "$TMP_ELF" "$UF2" --family rp2350-arm-s
+rm "$TMP_ELF"
+
+SIZE=$(wc -c < "$UF2" | tr -d ' ')
+echo "UF2: $UF2 ($SIZE bytes)"
+
+if [ ! -d "$VOLUME" ]; then
+    echo "Waiting for $VOLUME (hold BOOTSEL and plug in)..."
+    while [ ! -d "$VOLUME" ]; do sleep 0.5; done
+fi
+
+cp "$UF2" "$VOLUME/"
+echo "Deployed to $VOLUME"

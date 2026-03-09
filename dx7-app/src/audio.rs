@@ -26,6 +26,15 @@ impl AudioEngine {
         let (config, sample_format) = find_config(&device)?;
         let sample_rate = config.sample_rate.0;
 
+        // Synth runs at 48000 or 44100; upsample if device needs higher rate
+        let synth_rate = if sample_rate % 48000 == 0 {
+            48000
+        } else if sample_rate % 44100 == 0 {
+            44100
+        } else {
+            sample_rate // fallback, may not work perfectly
+        };
+
         // Create command ring buffer (512 commands for headroom)
         let ring = ringbuf::HeapRb::<SynthCommand>::new(512);
         let (command_tx, mut command_rx) = ring.split();
@@ -33,25 +42,39 @@ impl AudioEngine {
         let command_tx = Arc::new(Mutex::new(command_tx));
 
         // Create synth on the audio thread side
-        let mut synth = dx7_core::Synth::new(sample_rate);
+        let mut synth = dx7_core::Synth::new(synth_rate);
         synth.load_patch(initial_patch);
+        if sample_rate != synth_rate {
+            eprintln!("Audio device: {}Hz, synth: {}Hz ({}x upsample)", sample_rate, synth_rate, sample_rate / synth_rate);
+        }
 
         let channels = config.channels as usize;
+        let upsample_ratio = sample_rate / synth_rate;
 
         let render_f32 = move |data: &mut [f32], command_rx: &mut ringbuf::HeapCons<SynthCommand>, synth: &mut dx7_core::Synth| {
             while let Some(cmd) = command_rx.try_pop() {
                 synth.process_command(cmd);
             }
-            if channels == 2 {
+            let out_frames = data.len() / channels;
+            // Round up so we render enough synth frames to cover all output frames
+            let synth_frames = (out_frames + upsample_ratio as usize - 1) / upsample_ratio as usize;
+            if channels == 2 && upsample_ratio == 1 {
                 synth.render(data);
             } else {
-                let frames = data.len() / channels;
-                let mut stereo_buf = vec![0.0f32; frames * 2];
+                let mut stereo_buf = vec![0.0f32; synth_frames * 2];
                 synth.render(&mut stereo_buf);
-                for i in 0..frames {
-                    let sample = stereo_buf[i * 2];
-                    for ch in 0..channels {
-                        data[i * channels + ch] = sample;
+                for i in 0..out_frames {
+                    let src = (i / upsample_ratio as usize).min(synth_frames - 1);
+                    let l = stereo_buf[src * 2];
+                    let r = stereo_buf[src * 2 + 1];
+                    if channels >= 2 {
+                        data[i * channels] = l;
+                        data[i * channels + 1] = r;
+                    } else {
+                        data[i * channels] = l;
+                    }
+                    for ch in 2..channels {
+                        data[i * channels + ch] = 0.0;
                     }
                 }
             }
@@ -68,21 +91,23 @@ impl AudioEngine {
                 None,
             )},
             cpal::SampleFormat::I16 => {
-                // Pre-allocate buffer (max 8192 frames should cover any callback size)
+                // Pre-allocate buffer for synth frames
                 let mut float_buf = vec![0.0f32; 8192 * 2];
                 device.build_output_stream(
                 &config,
                 move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                    let frames = data.len() / channels;
+                    let out_frames = data.len() / channels;
+                    let synth_frames = (out_frames + upsample_ratio as usize - 1) / upsample_ratio as usize;
                     while let Some(cmd) = command_rx.try_pop() {
                         synth.process_command(cmd);
                     }
-                    let buf = &mut float_buf[..frames * 2];
+                    let buf = &mut float_buf[..synth_frames * 2];
                     buf.fill(0.0);
                     synth.render(buf);
-                    for i in 0..frames {
+                    for i in 0..out_frames {
+                        let src = (i / upsample_ratio as usize).min(synth_frames - 1);
                         for ch in 0..channels {
-                            let s = buf[i * 2 + ch.min(1)];
+                            let s = buf[src * 2 + ch.min(1)];
                             data[i * channels + ch] = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
                         }
                     }
@@ -99,7 +124,7 @@ impl AudioEngine {
         Ok(AudioEngine {
             _stream: stream,
             command_tx,
-            sample_rate,
+            sample_rate: synth_rate,
         })
     }
 
@@ -151,18 +176,17 @@ fn find_config(device: &Device) -> Result<(StreamConfig, cpal::SampleFormat), St
     let range = best.ok_or("No suitable audio output format found")?;
     let sample_format = range.sample_format();
 
-    // Only 48000 or 44100 — the synth only supports these rates
-    let sample_rate = if range.min_sample_rate().0 <= 48000 && range.max_sample_rate().0 >= 48000 {
-        SampleRate(48000)
-    } else if range.min_sample_rate().0 <= 44100 && range.max_sample_rate().0 >= 44100 {
-        SampleRate(44100)
-    } else {
-        return Err(format!(
-            "No supported sample rate (need 44100 or 48000, device supports {}-{})",
-            range.min_sample_rate().0,
-            range.max_sample_rate().0
-        ));
-    };
+    // Prefer native 48000/44100; accept integer multiples (96000, 88200, etc.)
+    let min = range.min_sample_rate().0;
+    let max = range.max_sample_rate().0;
+    let preferred = [48000, 44100, 96000, 88200, 192000, 176400];
+    let sample_rate = preferred.iter()
+        .find(|&&r| r >= min && r <= max)
+        .map(|&r| SampleRate(r))
+        .ok_or_else(|| format!(
+            "No supported sample rate (need 44100/48000 or multiple, device supports {}-{})",
+            min, max
+        ))?;
 
     Ok((range.with_sample_rate(sample_rate).config(), sample_format))
 }
