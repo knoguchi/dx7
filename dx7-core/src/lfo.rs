@@ -1,6 +1,6 @@
 //! DX7 integer LFO with 6 waveforms.
 //!
-//! Ported from Dexed/MSFA lfo.cc (Apache 2.0, Google Inc.).
+//! Based on MSFA lfo.cc (Apache 2.0, Google Inc.).
 //! All waveform outputs are in Q24 range (0..1<<24).
 
 use crate::generated_tables;

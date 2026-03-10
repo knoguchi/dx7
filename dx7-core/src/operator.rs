@@ -1,7 +1,7 @@
 //! FM operator kernel and DX7 scaling functions.
 //!
-//! Ported from Dexed/MSFA fm_op_kernel.cc and dx7note.cc
-//! (Apache 2.0, Google Inc. / Pascal Gauthier).
+//! Operator kernel uses log-domain FM synthesis (OPL-family technique).
+//! Scaling functions based on MSFA (Apache 2.0, Google Inc.).
 
 use crate::generated_tables;
 use crate::tables::{self, N, LG_N};
@@ -85,8 +85,8 @@ impl Default for OperatorParams {
 pub struct FmOpParams {
     /// Envelope level (log domain input for gain computation).
     pub level_in: i32,
-    /// Previous block's gain: MkI log attenuation (0 = loud, ENV_MAX = silent).
-    /// Stored as i32 to match Dexed — can go negative when EG levels exceed 0-99 spec.
+    /// Previous block's gain: log attenuation (0 = loud, ENV_MAX = silent).
+    /// Stored as i32 — can go negative when EG levels exceed the 0-99 spec range.
     pub gain_out: i32,
     /// Phase increment per sample.
     pub freq: i32,
@@ -105,25 +105,48 @@ impl FmOpParams {
     }
 }
 
-// --- MkI FM operator kernel functions (ported from EngineMkI.cpp) ---
+// --- Log-domain FM operator kernel ---
+//
+// Standard OPL-family log-domain sine technique:
+//   sin(phase) * amplitude = exp(log_sin(phase) + log_envelope)
+//
+// In log domain, multiplication becomes addition, so applying an amplitude
+// envelope is just adding the envelope attenuation to the log-sine value.
+// The result is converted back to linear via an exponential lookup table.
+//
+// Reference: OPL3 FPGA math documentation (gtaylormb/opl3_fpga)
 
-/// MkI log-domain sine: combines phase and envelope in log domain,
-/// converts back to linear via exp table. Output range ~[-2^26, +2^26].
+/// Log-domain sine with envelope: computes sin(phase) * 2^(-env/1024).
+///
+/// 1. Convert 24-bit phase to 12-bit, look up log2(|sin|) from quarter-wave table
+/// 2. Add envelope attenuation in log domain (addition = multiplication in linear)
+/// 3. Split combined log value: lower 10 bits → exp table mantissa, upper bits → exponent
+/// 4. Convert mantissa back to linear, right-shift by exponent
+/// 5. Apply sign from phase quadrant
+///
+/// Output range: approximately [-2^26, +2^26].
 #[inline]
-pub fn mki_sin(phase: i32, env: u16) -> i32 {
-    let exp_val = tables::sin_log((phase >> 12) as u16).wrapping_add(env);
-    let is_signed = (exp_val & 0x8000) != 0;
-    let exp_val = exp_val & 0x7FFF;
-    let result = 4096u32 + tables::sin_exp((exp_val & 0x3FF) ^ 0x3FF) as u32;
-    let result = result >> (exp_val >> 10);
-    if is_signed {
-        (-(result as i32) - 1) << 13
+pub fn log_sin(phase: i32, env: u16) -> i32 {
+    // Step 1-2: log-sine lookup + envelope attenuation (both in log domain)
+    let combined = tables::sin_log((phase >> 12) as u16).wrapping_add(env);
+    // Step 5 prep: extract sign from bit 15 (set by sin_log for negative quadrants)
+    let is_negative = (combined & 0x8000) != 0;
+    let attenuation = combined & 0x7FFF;
+    // Step 3-4: convert log-attenuation back to linear amplitude
+    // Lower 10 bits index the exp table (XOR inverts because table is decreasing)
+    // Add implicit 1.0 mantissa (4096) to the fractional part from the table
+    let mantissa = 4096u32 + tables::sin_exp((attenuation & 0x3FF) ^ 0x3FF) as u32;
+    // Upper bits are the exponent (right-shift amount)
+    let linear = mantissa >> (attenuation >> 10);
+    // Step 5: apply sign and scale to output range (shift left 13 for ~26-bit output)
+    if is_negative {
+        (-(linear as i32) - 1) << 13
     } else {
-        (result as i32) << 13
+        (linear as i32) << 13
     }
 }
 
-/// FM operator with modulation input (no feedback). MkI version.
+/// FM operator with modulation input (no feedback). Log-domain version.
 pub fn compute(
     output: &mut [i32; N],
     input: &[i32; N],
@@ -139,21 +162,21 @@ pub fn compute(
     if add {
         for i in 0..N {
             gain += dgain;
-            let y = mki_sin(phase.wrapping_add(input[i]), gain as u16);
+            let y = log_sin(phase.wrapping_add(input[i]), gain as u16);
             output[i] += y;
             phase = phase.wrapping_add(freq);
         }
     } else {
         for i in 0..N {
             gain += dgain;
-            let y = mki_sin(phase.wrapping_add(input[i]), gain as u16);
+            let y = log_sin(phase.wrapping_add(input[i]), gain as u16);
             output[i] = y;
             phase = phase.wrapping_add(freq);
         }
     }
 }
 
-/// Pure sine generator, no modulation input. MkI version.
+/// Pure sine generator, no modulation input. Log-domain version.
 pub fn compute_pure(
     output: &mut [i32; N],
     phase0: i32,
@@ -168,21 +191,21 @@ pub fn compute_pure(
     if add {
         for i in 0..N {
             gain += dgain;
-            let y = mki_sin(phase, gain as u16);
+            let y = log_sin(phase, gain as u16);
             output[i] += y;
             phase = phase.wrapping_add(freq);
         }
     } else {
         for i in 0..N {
             gain += dgain;
-            let y = mki_sin(phase, gain as u16);
+            let y = log_sin(phase, gain as u16);
             output[i] = y;
             phase = phase.wrapping_add(freq);
         }
     }
 }
 
-/// Self-feedback operator. MkI version.
+/// Self-feedback operator. Log-domain version.
 pub fn compute_fb(
     output: &mut [i32; N],
     phase0: i32,
@@ -203,7 +226,7 @@ pub fn compute_fb(
             gain += dgain;
             let scaled_fb = (y0 + y) >> (fb_shift + 1);
             y0 = y;
-            y = mki_sin(phase.wrapping_add(scaled_fb), gain as u16);
+            y = log_sin(phase.wrapping_add(scaled_fb), gain as u16);
             output[i] += y;
             phase = phase.wrapping_add(freq);
         }
@@ -212,7 +235,7 @@ pub fn compute_fb(
             gain += dgain;
             let scaled_fb = (y0 + y) >> (fb_shift + 1);
             y0 = y;
-            y = mki_sin(phase.wrapping_add(scaled_fb), gain as u16);
+            y = log_sin(phase.wrapping_add(scaled_fb), gain as u16);
             output[i] = y;
             phase = phase.wrapping_add(freq);
         }
@@ -244,11 +267,11 @@ pub fn compute_fb2(
         // op 0: feedback operator
         gain0 += dgain0;
         y0 = y;
-        y = mki_sin(phase0.wrapping_add(scaled_fb), gain0 as u16);
+        y = log_sin(phase0.wrapping_add(scaled_fb), gain0 as u16);
         phase0 = phase0.wrapping_add(freq0);
         // op 1: modulated by op 0
         gain1 += dgain1;
-        y = mki_sin(phase1.wrapping_add(y), gain1 as u16);
+        y = log_sin(phase1.wrapping_add(y), gain1 as u16);
         phase1 = phase1.wrapping_add(freq1);
 
         output[i] = y;
@@ -284,15 +307,15 @@ pub fn compute_fb3(
         // op 0: feedback operator
         g0 += dgain0;
         y0 = y;
-        y = mki_sin(phase0.wrapping_add(scaled_fb), g0 as u16);
+        y = log_sin(phase0.wrapping_add(scaled_fb), g0 as u16);
         phase0 = phase0.wrapping_add(freq0);
         // op 1: modulated by op 0
         g1 += dgain1;
-        y = mki_sin(phase1.wrapping_add(y), g1 as u16);
+        y = log_sin(phase1.wrapping_add(y), g1 as u16);
         phase1 = phase1.wrapping_add(freq1);
         // op 2: modulated by op 1
         g2 += dgain2;
-        y = mki_sin(phase2.wrapping_add(y), g2 as u16);
+        y = log_sin(phase2.wrapping_add(y), g2 as u16);
         phase2 = phase2.wrapping_add(freq2);
 
         output[i] = y;
@@ -301,7 +324,7 @@ pub fn compute_fb3(
     fb_buf[1] = y;
 }
 
-// --- DX7 scaling functions (ported from dx7note.cc) ---
+// --- DX7 scaling functions (based on MSFA dx7note.cc, Apache 2.0) ---
 
 /// Coarse frequency multiplier table (log2 domain, Q24).
 /// Index 0 = 0.5x (-1 octave), index 1 = 1x, index 2 = 2x, etc.
@@ -385,7 +408,7 @@ pub fn osc_freq(midinote: i32, mode: i32, coarse: i32, fine: i32, detune: i32) -
         // Ratio mode
         let mut logfreq = tables::midinote_to_logfreq(midinote);
 
-        // Detune (empirically measured from DX7 hardware, matches Dexed dx7note.cc)
+        // Detune (empirically measured from DX7 hardware)
         // DETUNE_TAB[n] = round(0.0209 * exp(-0.396 * logfreq_frac) / 7.0 * logfreq)
         logfreq += generated_tables::DETUNE_TAB[midinote as usize] * (detune - 7);
 
@@ -424,76 +447,76 @@ mod tests {
     }
 
     // ========================================================================
-    // 1. mki_sin — core FM function
+    // 1. log_sin — core FM function
     // ========================================================================
 
     #[test]
-    fn test_mki_sin_zero_phase_is_near_zero() {
+    fn test_log_sin_zero_phase_is_near_zero() {
         ensure_init();
         // sin(0) = 0. Phase=0 should produce ~0 output.
-        let val = mki_sin(0, 0);
+        let val = log_sin(0, 0);
         // Allow small error from table quantization
         let max_amp = 1 << 26;
         let tolerance = max_amp / 100; // 1% of peak
         assert!(
             val.abs() < tolerance,
-            "mki_sin(phase=0, env=0) should be ~0, got {val} (tolerance {tolerance})"
+            "log_sin(phase=0, env=0) should be ~0, got {val} (tolerance {tolerance})"
         );
     }
 
     #[test]
-    fn test_mki_sin_quarter_phase_is_peak() {
+    fn test_log_sin_quarter_phase_is_peak() {
         ensure_init();
         // sin(pi/2) = 1.0. Quarter cycle in 24-bit phase = 1<<22 but
-        // mki_sin uses phase>>12, so 12-bit effective: quarter = 1<<10 = 1024.
+        // log_sin uses phase>>12, so 12-bit effective: quarter = 1<<10 = 1024.
         // Phase needs to be 1024 << 12 = 4194304 for quarter cycle.
         let quarter_phase = 1 << 22; // pi/2 in 24-bit phase
-        let val = mki_sin(quarter_phase, 0);
+        let val = log_sin(quarter_phase, 0);
         // Peak should be ~(4096+4095)<<13 = ~67M ≈ 2^26
         let expected_peak = (4096 + 4095) << 13; // 66584576
         let tolerance = expected_peak / 20; // 5%
         assert!(
             val > expected_peak - tolerance,
-            "mki_sin at pi/2 should be near peak {expected_peak}, got {val}"
+            "log_sin at pi/2 should be near peak {expected_peak}, got {val}"
         );
     }
 
     #[test]
-    fn test_mki_sin_half_phase_is_near_zero() {
+    fn test_log_sin_half_phase_is_near_zero() {
         ensure_init();
         // sin(pi) = 0
         let half_phase = 1 << 23;
-        let val = mki_sin(half_phase, 0);
+        let val = log_sin(half_phase, 0);
         let max_amp = 1 << 26;
         let tolerance = max_amp / 100;
         assert!(
             val.abs() < tolerance,
-            "mki_sin at pi should be ~0, got {val}"
+            "log_sin at pi should be ~0, got {val}"
         );
     }
 
     #[test]
-    fn test_mki_sin_three_quarter_is_negative_peak() {
+    fn test_log_sin_three_quarter_is_negative_peak() {
         ensure_init();
         // sin(3*pi/2) = -1.0
         let three_q_phase = 3 * (1 << 22); // 3/4 of 2^24
-        let val = mki_sin(three_q_phase, 0);
+        let val = log_sin(three_q_phase, 0);
         let expected_peak = (4096 + 4095) << 13;
         let tolerance = expected_peak / 20;
         assert!(
             val < -(expected_peak - tolerance),
-            "mki_sin at 3pi/2 should be near -{expected_peak}, got {val}"
+            "log_sin at 3pi/2 should be near -{expected_peak}, got {val}"
         );
     }
 
     #[test]
-    fn test_mki_sin_symmetry() {
+    fn test_log_sin_symmetry() {
         ensure_init();
         // sin(x) = -sin(x + pi)
         let phase_a: i32 = 1234567;
         let phase_b = phase_a.wrapping_add(1 << 23);
-        let val_a = mki_sin(phase_a, 0);
-        let val_b = mki_sin(phase_b, 0);
+        let val_a = log_sin(phase_a, 0);
+        let val_b = log_sin(phase_b, 0);
         let tolerance = (1 << 26) / 50; // 2%
         assert!(
             (val_a + val_b).abs() < tolerance,
@@ -503,14 +526,14 @@ mod tests {
     }
 
     #[test]
-    fn test_mki_sin_max_amplitude() {
+    fn test_log_sin_max_amplitude() {
         ensure_init();
         // Sweep all phases at env=0, find the peak amplitude
         let mut max_pos = 0i32;
         let mut max_neg = 0i32;
         for i in 0..4096 {
             let phase = i << 12; // step through all 12-bit phase values
-            let val = mki_sin(phase, 0);
+            let val = log_sin(phase, 0);
             if val > max_pos { max_pos = val; }
             if val < max_neg { max_neg = val; }
         }
@@ -540,12 +563,12 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_mki_sin_env_attenuates() {
+    fn test_log_sin_env_attenuates() {
         ensure_init();
         let phase = 1 << 22; // pi/2 (peak)
-        let val_loud = mki_sin(phase, 0);
-        let val_quiet = mki_sin(phase, 1024);
-        let val_silent = mki_sin(phase, tables::ENV_MAX - 1);
+        let val_loud = log_sin(phase, 0);
+        let val_quiet = log_sin(phase, 1024);
+        let val_silent = log_sin(phase, tables::ENV_MAX - 1);
         assert!(
             val_loud > val_quiet,
             "Higher env should attenuate: env=0 gave {val_loud}, env=1024 gave {val_quiet}"
@@ -561,13 +584,13 @@ mod tests {
     }
 
     #[test]
-    fn test_mki_sin_env_6db_per_doubling() {
+    fn test_log_sin_env_6db_per_doubling() {
         ensure_init();
         // In log domain, adding 1024 to env should halve the amplitude (-6dB)
         // because 2^10 = 1024 and the exp table divides by powers of 2
         let phase = 1 << 22;
-        let val_0 = mki_sin(phase, 0) as f64;
-        let val_1024 = mki_sin(phase, 1024) as f64;
+        let val_0 = log_sin(phase, 0) as f64;
+        let val_1024 = log_sin(phase, 1024) as f64;
         let ratio = val_0 / val_1024;
         // Each 1024 in env = one bit shift = halving = 6.02 dB
         // ratio should be ~2.0

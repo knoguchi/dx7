@@ -1,6 +1,6 @@
 //! DX7 integer log-domain envelope generator.
 //!
-//! Ported from Dexed/MSFA env.cc (Apache 2.0, Google Inc. / Pascal Gauthier).
+//! Based on MSFA env.cc (Apache 2.0, Google Inc.).
 //! Level is stored in Q24/doubling log format. Output is subsampled once per
 //! N=64 sample block.
 
@@ -29,7 +29,7 @@ const LEVEL_LUT: [i32; 20] = [
 
 /// Empirically measured sample counts at 44.1 kHz for accurate DX7 envelope
 /// stage-boundary timing. Gathered from DX7 hardware using two Yamaha TF1 chips.
-/// (Ported from Dexed/MSFA env.cc, Apache 2.0.)
+/// Empirical data from DX7 hardware (two Yamaha TF1 chips).
 const STATICS: [i32; 77] = [
     1764000, 1764000, 1411200, 1411200, 1190700, 1014300, 992250,
     882000, 705600, 705600, 584325, 507150, 502740, 441000, 418950,

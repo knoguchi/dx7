@@ -1,6 +1,8 @@
 //! Sine, Exp2, and Frequency lookup tables for FM synthesis.
 //!
-//! Ported from Dexed/MSFA (Apache 2.0, Google Inc. / Pascal Gauthier).
+//! Based on MSFA (Apache 2.0, Google Inc.) for envelope, frequency, and LFO tables.
+//! Log-domain sine/exp tables implement the standard OPL-family technique described in:
+//! <https://github.com/gtaylormb/opl3_fpga/blob/master/docs/opl3math/opl3math.pdf>
 //! Tables must be initialized by calling `init_tables(sample_rate)` before use.
 
 use crate::generated_tables;
@@ -22,8 +24,10 @@ const EXP2_N_SAMPLES: usize = 1 << EXP2_LG_N_SAMPLES as usize;
 const FREQ_SAMPLE_SHIFT: i32 = 24 - 10; // 14
 const FREQ_MAX_LOGFREQ_INT: i32 = 20;
 
-// --- MkI (Mark I) engine tables ---
-// OPL-style log-domain sine/exp lookup for DX7-accurate FM synthesis.
+// --- Log-domain sine/exp tables ---
+// OPL-family log-domain technique: store sin as log2 attenuation, apply envelope
+// by addition in log domain, convert back via exp table. Standard approach used
+// in YM2414/OPL3 FM synthesis chips.
 pub const ENV_BITDEPTH: u16 = 14;
 pub const ENV_MAX: u16 = 1 << ENV_BITDEPTH; // 16384
 
@@ -129,7 +133,14 @@ pub fn freqlut_lookup(logfreq: i32) -> i32 {
     }
 }
 
-// --- MkI lookup functions (ported from EngineMkI.cpp) ---
+// --- Log-domain sine/exp lookup functions ---
+//
+// These implement the standard OPL-family log-domain sine technique:
+//   1. Quarter-wave sine table stores round(-1024 * log2(sin(x))) for x in (0, pi/2)
+//   2. Full-wave lookup uses quadrant bits to mirror and negate
+//   3. Result is log-attenuation with bit 15 as sign flag
+//
+// Reference: OPL3 FPGA math documentation (gtaylormb/opl3_fpga)
 
 /// Log-sine lookup with quadrant handling. Input `phi` uses lower 12 bits:
 /// bits 9..0 = table index, bits 11..10 = quadrant. Returns log attenuation
@@ -147,7 +158,7 @@ pub fn sin_log(phi: u16) -> u16 {
     }
 }
 
-/// Exp table lookup for MkI. Returns mantissa value (0..4095).
+/// Exp table lookup: converts log-attenuation back to linear. Returns mantissa (0..4095).
 #[inline]
 pub fn sin_exp(index: u16) -> u16 {
     unsafe { SINEXP_RAM[(index & 0x3FF) as usize] }

@@ -95,4 +95,3 @@ The `sysex/` directory contains DX7 patch banks organized by source:
 ## Reference
 
 - [music-synthesizer-for-android](https://github.com/google/music-synthesizer-for-android) (msfa) engine
-- [Dexed](https://github.com/asb2m10/dexed)

@@ -2,7 +2,6 @@ target/
 *.zip
 *.mp3
 *.xlsx
-/dexed/
 /midi/
 /sysex/JackDeckard/
 /sysex/Keys/

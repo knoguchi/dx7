@@ -76,7 +76,7 @@ struct Args {
     channel_map: Vec<String>,
 
     /// Disable effects chain (reverb, chorus, tremolo, exciter, widener, saturation)
-    /// for dry output comparable to Dexed
+    /// for dry output without effects
     #[arg(long)]
     dry: bool,
 

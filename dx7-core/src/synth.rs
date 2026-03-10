@@ -311,7 +311,7 @@ impl Synth {
                 }
             }
 
-            // Convert full block to f32 (matches Dexed PluginProcessor.cpp lines 268-272)
+            // Convert full block to f32: clip to 24-bit signed, shift >> 9, normalize
             // val >> 4 already done above; now clip to 24-bit, shift >> 9, normalize to float
             let mut block_f32 = [0.0f32; N];
             for i in 0..N {

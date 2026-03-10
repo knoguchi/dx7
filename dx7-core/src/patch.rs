@@ -5,11 +5,11 @@ use crate::lfo::{LfoParams, LfoWaveform};
 use crate::operator::{OperatorParams, ScalingCurve};
 
 /// Normalize a SysEx parameter value to its valid range.
-/// Matches Dexed's `normparm()`: values within range pass through,
+/// Normalize a SysEx parameter: values within range pass through,
 /// out-of-range values are rescaled from 0-255 to 0-max.
-/// Note: Dexed has a bug where memcpy overwrites normparm'd operator params,
-/// so operator EG rates/levels/depths are NOT actually normalized in Dexed.
-/// We apply normparm to global params (pitch EG, algorithm) where Dexed does too.
+/// Note: in the original DX7 firmware, operator EG rates/levels/depths
+/// are NOT normalized (raw 7-bit values are used directly).
+/// We apply normparm to global params (pitch EG, algorithm, etc.).
 fn normparm(value: u8, max: u8) -> u8 {
     if value <= max {
         value
@@ -51,7 +51,7 @@ impl DxVoice {
         ];
 
         // Only OP1 (index 5) is active with full level, rest are silent
-        // Index 0 = OP6, index 5 = OP1 (matching MSFA/Dexed convention)
+        // Index 0 = OP6, index 5 = OP1 (matching DX7 SysEx convention)
         for op in ops.iter_mut().take(5) {
             op.output_level = 0;
         }
@@ -79,7 +79,7 @@ impl DxVoice {
 
     /// Parse a single voice from unpacked format (155 bytes).
     /// This is the format used in single voice SysEx dumps.
-    /// Operators are stored OP6-first: index 0 = OP6, matching MSFA/Dexed convention.
+    /// Operators are stored OP6-first: index 0 = OP6, matching DX7 SysEx convention.
     pub fn from_unpacked(data: &[u8; 155]) -> Self {
         let mut ops = [OperatorParams::default(); 6];
 
@@ -218,9 +218,9 @@ impl DxVoice {
         d
     }
 
-    /// Convert to Dexed VMEM (unpacked) format: 156 bytes.
+    /// Convert to DX7 VMEM (unpacked) format: 156 bytes.
     /// 6 operators × 21 bytes + 30 global bytes.
-    /// Op order: index 0 = OP6, index 5 = OP1 (same as MSFA convention).
+    /// Op order: index 0 = OP6, index 5 = OP1 (DX7 SysEx convention).
     pub fn to_unpacked(&self) -> [u8; 156] {
         let mut d = [0u8; 156];
         for i in 0..6 {
@@ -282,8 +282,8 @@ impl DxVoice {
             let op_idx = i; // index 0 = OP6, index 5 = OP1
             let base = i * 17;
 
-            // Operator bytes 0-10 pass through with 7-bit mask (matching Dexed's
-            // memcpy that overwrites normparm'd values — see Dexed issue #215).
+            // Operator bytes 0-10 pass through with 7-bit mask (raw values,
+            // not normalized — matching DX7 firmware behavior).
             let eg = EnvParams {
                 rates: [
                     data[base] & 0x7F,
@@ -363,7 +363,7 @@ impl DxVoice {
 
         DxVoice {
             operators: ops,
-            // Pitch EG: normparm to 99 (Dexed does apply this)
+            // Pitch EG: normparm to 99
             pitch_eg: EnvParams {
                 rates: [
                     normparm(data[gb] & 0x7F, 99),

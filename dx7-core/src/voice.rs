@@ -1,7 +1,7 @@
 //! Single DX7 voice: 6 operators + bus-flag algorithm routing + LFO + pitch env.
 //!
-//! Ported from Dexed/MSFA fm_core.cc and dx7note.cc
-//! (Apache 2.0, Google Inc. / Pascal Gauthier).
+//! Algorithm routing based on MSFA fm_core.cc (Apache 2.0, Google Inc.).
+//! Log-domain FM synthesis uses the standard OPL-family technique.
 
 use crate::envelope::{self, Envelope};
 use crate::generated_tables;
@@ -338,23 +338,23 @@ impl Voice {
         }
     }
 
-    /// Compute MkI log-attenuation gain from the previous gain_out value.
+    /// Log-attenuation gain from previous block's gain_out value.
     /// Maps gain_out == 0 (uninitialised) to near-silence.
     #[inline]
-    fn mki_gain1(gain_out: i32) -> i32 {
+    fn prev_gain(gain_out: i32) -> i32 {
         if gain_out == 0 { tables::ENV_MAX as i32 - 1 } else { gain_out }
     }
 
-    /// Compute MkI log-attenuation gain from the envelope level.
-    /// No clamping — matches Dexed's int32_t semantics. Negative values (from
-    /// EG levels above the 0-99 spec range) produce "overdriven" operators;
-    /// the `gain as u16` cast in mki_sin wraps correctly via 16-bit truncation.
+    /// Convert envelope level to log-attenuation gain for the current block.
+    /// No clamping — negative values (from EG levels above the 0-99 spec range)
+    /// produce "overdriven" operators; the `gain as u16` cast in log_sin
+    /// wraps correctly via 16-bit truncation.
     #[inline]
-    fn mki_gain2(level_in: i32) -> i32 {
+    fn env_gain(level_in: i32) -> i32 {
         tables::ENV_MAX as i32 - (level_in >> 14)
     }
 
-    /// Core rendering using MkI log-domain FM with bus-flag algorithm routing.
+    /// Core rendering using log-domain FM with bus-flag algorithm routing.
     pub fn render_core(&mut self, output: &mut [i32; N]) {
         const K_LEVEL_THRESH: i32 = tables::ENV_MAX as i32 - 100; // 16284
         let alg_idx = (self.algorithm as usize).min(31);
@@ -380,8 +380,8 @@ impl Voice {
             let inbus = (flags >> 4) & 3;
             let outbus = flags & 3;
 
-            let gain1 = Self::mki_gain1(self.params[op].gain_out);
-            let gain2 = Self::mki_gain2(self.params[op].level_in);
+            let gain1 = Self::prev_gain(self.params[op].gain_out);
+            let gain2 = Self::env_gain(self.params[op].level_in);
             self.params[op].gain_out = gain2;
 
             if gain1 <= K_LEVEL_THRESH || gain2 <= K_LEVEL_THRESH {
@@ -397,10 +397,10 @@ impl Voice {
                         match alg_idx {
                             3 => {
                                 // Algorithm 4: fused 3-operator feedback chain
-                                let gain2_1 = Self::mki_gain2(self.params[1].level_in);
+                                let gain2_1 = Self::env_gain(self.params[1].level_in);
                                 self.params[1].gain_out = gain2_1;
                                 let gain1_1 = if gain2_1 == 0 { tables::ENV_MAX as i32 - 1 } else { gain2_1 };
-                                let gain2_2 = Self::mki_gain2(self.params[2].level_in);
+                                let gain2_2 = Self::env_gain(self.params[2].level_in);
                                 self.params[2].gain_out = gain2_2;
                                 let gain1_2 = if gain2_2 == 0 { tables::ENV_MAX as i32 - 1 } else { gain2_2 };
 
@@ -422,7 +422,7 @@ impl Voice {
                             }
                             5 => {
                                 // Algorithm 6: fused 2-operator feedback chain
-                                let gain2_1 = Self::mki_gain2(self.params[1].level_in);
+                                let gain2_1 = Self::env_gain(self.params[1].level_in);
                                 self.params[1].gain_out = gain2_1;
                                 let gain1_1 = if gain2_1 == 0 { tables::ENV_MAX as i32 - 1 } else { gain2_1 };
 

@@ -1,7 +1,7 @@
 //! Bottom-up integration tests for the DX7 signal chain.
 //!
 //! Tests each component from tables → operators → voice → synth,
-//! comparing against known-good values from Dexed/MSFA.
+//! comparing against known-good values from MSFA (Apache 2.0, Google Inc.).
 
 use std::sync::Once;
 
@@ -148,15 +148,15 @@ mod operator_tests {
     #[test]
     fn compute_pure_produces_sine() {
         ensure_init();
-        // Generate one block at A440 with full gain (MkI: 0 = no attenuation)
+        // Generate one block at A440 with full gain (log-domain: 0 = no attenuation)
         let logfreq = tables::midinote_to_logfreq(69);
         let freq = tables::freqlut_lookup(logfreq);
-        let gain: i32 = 0; // Full gain (MkI log attenuation: 0 = loudest)
+        let gain: i32 = 0; // Full gain (log attenuation: 0 = loudest)
         let mut output = [0i32; N];
 
         operator::compute_pure(&mut output, 0, freq, gain, gain, false);
 
-        // Output should not be all zeros. MkI peak is ~2^26.
+        // Output should not be all zeros. Log-domain peak is ~2^26.
         let max_val = output.iter().map(|x| x.abs()).max().unwrap();
         assert!(
             max_val > 1 << 22,
@@ -188,7 +188,7 @@ mod operator_tests {
 
         operator::compute_pure(&mut output, 0, freq, gain, gain, true);
 
-        // In add mode, output[0] should be base + mki_sin(0, 0) (small value near zero crossing)
+        // In add mode, output[0] should be base + log_sin(0, 0) (small value near zero crossing)
         // The base value should still be dominant
         assert!(
             output[0] > base / 2,
@@ -292,7 +292,7 @@ mod operator_tests {
         let gain: i32 = 0;
 
         // fb_shift=16 means minimal feedback (shift very far right).
-        // MkI output peaks at ~2^26 so even tiny residual feedback
+        // Log-domain output peaks at ~2^26 so even tiny residual feedback
         // can cause small differences.
         let mut fb_buf = [0i32; 2];
         let mut fb_out = [0i32; N];
@@ -759,32 +759,32 @@ mod epiano1_tests {
         let voice = rom1a::load_rom1a_voice(10).unwrap();
         assert_eq!(voice.algorithm, 4, "E.PIANO 1 should use algorithm 5 (idx 4)");
         assert_eq!(voice.feedback, 6);
-        assert!(voice.osc_key_sync);
+        assert!(!voice.osc_key_sync);
         assert_eq!(voice.transpose, 24);
 
-        // OP6 (index 0): carrier-like, FC=1, OL=98
+        // OP6 (index 0): FC=1, OL=79
         assert_eq!(voice.operators[0].osc_freq_coarse, 1);
-        assert_eq!(voice.operators[0].output_level, 98);
+        assert_eq!(voice.operators[0].output_level, 79);
 
-        // OP5 (index 1): FC=14 (the bell tone), OL=60
-        assert_eq!(voice.operators[1].osc_freq_coarse, 14);
-        assert_eq!(voice.operators[1].output_level, 60);
+        // OP5 (index 1): FC=1, OL=99
+        assert_eq!(voice.operators[1].osc_freq_coarse, 1);
+        assert_eq!(voice.operators[1].output_level, 99);
 
-        // OP4 (index 2): FC=1, OL=94
+        // OP4 (index 2): FC=1, OL=89
         assert_eq!(voice.operators[2].osc_freq_coarse, 1);
-        assert_eq!(voice.operators[2].output_level, 94);
+        assert_eq!(voice.operators[2].output_level, 89);
 
-        // OP3 (index 3): FC=1, OL=60
+        // OP3 (index 3): FC=1, OL=99
         assert_eq!(voice.operators[3].osc_freq_coarse, 1);
-        assert_eq!(voice.operators[3].output_level, 60);
+        assert_eq!(voice.operators[3].output_level, 99);
 
-        // OP2 (index 4): FC=1, OL=86
-        assert_eq!(voice.operators[4].osc_freq_coarse, 1);
-        assert_eq!(voice.operators[4].output_level, 86);
+        // OP2 (index 4): FC=14 (the bell tone), OL=58
+        assert_eq!(voice.operators[4].osc_freq_coarse, 14);
+        assert_eq!(voice.operators[4].output_level, 58);
 
-        // OP1 (index 5): FC=1, OL=98
+        // OP1 (index 5): FC=1, OL=99
         assert_eq!(voice.operators[5].osc_freq_coarse, 1);
-        assert_eq!(voice.operators[5].output_level, 98);
+        assert_eq!(voice.operators[5].output_level, 99);
     }
 
     #[test]
@@ -1009,11 +1009,11 @@ mod fm_depth_tests {
     fn simple_fm_pair_produces_sidebands() {
         ensure_init();
         // Create a simple modulator→carrier pair manually.
-        // MkI log-domain FM synthesis should produce harmonics.
+        // Log-domain FM synthesis should produce harmonics.
         let sample_rate = 44100.0;
         let logfreq = tables::midinote_to_logfreq(69); // A4 = 440 Hz
         let freq = tables::freqlut_lookup(logfreq);
-        let gain: i32 = 0; // Full gain (MkI: 0 = no attenuation)
+        let gain: i32 = 0; // Full gain (log-domain: 0 = no attenuation)
 
         // Step 1: Generate modulator output (pure sine)
         let num_blocks = 200;
@@ -1044,7 +1044,7 @@ mod fm_depth_tests {
         // Skip first few blocks for transient
         let stable = &car_samples[N * 10..];
 
-        // MkI output peaks at ~2^26. The modulation creates harmonics at n*440 Hz.
+        // Log-domain output peaks at ~2^26. The modulation creates harmonics at n*440 Hz.
         let _power_440 = goertzel_power(stable, 440.0, sample_rate);
         let power_880 = goertzel_power(stable, 880.0, sample_rate);
         let power_1320 = goertzel_power(stable, 1320.0, sample_rate);
@@ -1071,8 +1071,8 @@ mod fm_depth_tests {
         }
 
         let pure_power_880 = goertzel_power(&pure_samples[N * 10..], 880.0, sample_rate);
-        // MkI log-domain quantization introduces slight harmonics even in "pure"
-        // sine, so the ratio is smaller than with MSFA linear sine.
+        // Log-domain quantization introduces slight harmonics even in "pure"
+        // sine, so the ratio is smaller than with linear sine.
         assert!(
             power_880 > pure_power_880 * 10.0,
             "FM should have much stronger 2nd harmonic than pure sine: \

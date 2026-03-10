@@ -1,6 +1,6 @@
 //! DX7 pitch envelope generator.
 //!
-//! Ported from Dexed/MSFA pitchenv.cc (Apache 2.0, Google Inc.).
+//! Based on MSFA pitchenv.cc (Apache 2.0, Google Inc.).
 //! Output is in Q24/octave format.
 
 /// Pitch envelope rate table (maps DX7 rate 0..99 to internal rate).
