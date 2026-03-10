@@ -13,7 +13,7 @@ use dx7_core::voice::Voice;
 use dx7_core::load_rom1a_voice;
 use dx7_core::tables::N;
 
-const MAX_VOICES: usize = 8;
+const MAX_VOICES: usize = 16;
 
 const SAMPLE_RATE: u32 = 48000;
 const CPU_HZ: u32 = 200_000_000;
@@ -325,6 +325,10 @@ mod mc_render {
     pub static RENDER_START: AtomicBool = AtomicBool::new(false);
     /// Core 1 sets RENDER_DONE=true when finished. Core 0 checks before combining.
     pub static RENDER_DONE: AtomicBool = AtomicBool::new(true);
+
+    /// Render cycles for the most recent block (written by core 0 render loop).
+    pub static RENDER_CYCLES: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
 
     /// Core 1 entry: render voices MAX_VOICES/2..MAX_VOICES on demand.
     /// DMA handles PWM output — core 1 only renders voices.
@@ -640,7 +644,7 @@ async fn usb_midi_pwm_synth(
     let midi = embassy_usb::class::midi::MidiClass::new(&mut builder, 1, 1, 64);
     let mut usb = builder.build();
 
-    let (_sender, mut receiver) = midi.split();
+    let (mut sender, mut receiver) = midi.split();
 
     static MIDI_QUEUE: dx7_midi::MidiQueue = dx7_midi::MidiQueue::new();
 
@@ -656,6 +660,17 @@ async fn usb_midi_pwm_synth(
 
     // Task 1: USB device driver
     let usb_run = usb.run();
+
+    // Task: CPU meter — sends CC 119 via USB MIDI every 500ms (async, never blocks render)
+    let cpu_meter = async {
+        loop {
+            embassy_time::Timer::after_millis(500).await;
+            let cycles = mc_render::RENDER_CYCLES.load(core::sync::atomic::Ordering::Relaxed);
+            let pct = ((cycles as u64 * 127) / 266667).min(127) as u8;
+            let packet = [0x0B, 0xB0, 119, pct];
+            let _ = sender.write_packet(&packet).await;
+        }
+    };
 
     // Task 2: Read USB MIDI packets (with SysEx accumulation)
     let midi_read = async {
@@ -810,6 +825,8 @@ async fn usb_midi_pwm_synth(
                 dispatch_midi(msg, voices, voice_ages, voice_age, &current_patch);
             }
 
+            let t0 = read_cycles();
+
             // Signal core 1 to render voices 2..4
             mc_render::RENDER_DONE.store(false, core::sync::atomic::Ordering::Relaxed);
             mc_render::RENDER_START.store(true, core::sync::atomic::Ordering::Release);
@@ -857,6 +874,12 @@ async fn usb_midi_pwm_synth(
                 duties[i] = usat::<10>(duty) as u16;
             }
 
+            // Store render cycles for async CPU meter (excludes DMA wait)
+            mc_render::RENDER_CYCLES.store(
+                read_cycles().wrapping_sub(t0),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+
             // Wait for DMA buffer available, yielding to let USB tasks run
             while !dma_audio::poll_and_check() {
                 embassy_futures::yield_now().await;
@@ -874,8 +897,8 @@ async fn usb_midi_pwm_synth(
         }
     };
 
-    // Run all three concurrently on core 0
-    embassy_futures::join::join3(usb_run, midi_read, audio_render).await;
+    // Run all four concurrently on core 0
+    embassy_futures::join::join4(usb_run, midi_read, cpu_meter, audio_render).await;
     core::unreachable!()
 }
 
@@ -989,13 +1012,26 @@ async fn usb_ble_midi_pwm_synth(
 
     let midi = embassy_usb::class::midi::MidiClass::new(&mut builder, 1, 1, 64);
     let mut usb = builder.build();
-    let (_sender, mut receiver) = midi.split();
+    let (mut sender, mut receiver) = midi.split();
 
     // Task: CYW43 background driver
     let cyw43_task = runner.run();
 
     // Task: USB device driver
     let usb_run = usb.run();
+
+    // Task: CPU meter — sends CC 119 via USB MIDI every 500ms (async, never blocks render)
+    let cpu_meter = async {
+        loop {
+            embassy_time::Timer::after_millis(500).await;
+            let cycles = mc_render::RENDER_CYCLES.load(core::sync::atomic::Ordering::Relaxed);
+            // Budget: 64 samples at 48kHz = 266667 cycles at 200MHz
+            let pct = ((cycles as u64 * 127) / 266667).min(127) as u8;
+            // USB MIDI packet: CIN=0x0B (CC), channel 1, CC#119, value
+            let packet = [0x0B, 0xB0, 119, pct];
+            let _ = sender.write_packet(&packet).await;
+        }
+    };
 
     // Task: USB MIDI reader (with SysEx accumulation)
     let midi_read = async {
@@ -1233,6 +1269,8 @@ async fn usb_ble_midi_pwm_synth(
                     dispatch_midi(msg, voices, voice_ages, voice_age, &current_patch);
                 }
 
+                let t0 = read_cycles();
+
                 // Signal core 1
                 mc_render::RENDER_DONE.store(false, core::sync::atomic::Ordering::Relaxed);
                 mc_render::RENDER_START.store(true, core::sync::atomic::Ordering::Release);
@@ -1273,6 +1311,12 @@ async fn usb_ble_midi_pwm_synth(
                     duties[i] = usat::<10>(duty) as u16;
                 }
 
+                // Store render cycles for async CPU meter (excludes DMA wait)
+                mc_render::RENDER_CYCLES.store(
+                    read_cycles().wrapping_sub(t0),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+
                 while !dma_audio::poll_and_check() {
                     embassy_futures::yield_now().await;
                 }
@@ -1299,7 +1343,7 @@ async fn usb_ble_midi_pwm_synth(
 
     // CYW43 runner + USB driver must run alongside everything else
     embassy_futures::join::join3(cyw43_task, usb_run,
-        embassy_futures::join::join(midi_read, ble_usb_and_audio),
+        embassy_futures::join::join3(midi_read, cpu_meter, ble_usb_and_audio),
     ).await;
     core::unreachable!()
 }
@@ -1525,6 +1569,8 @@ async fn ble_midi_pwm_synth(
                 dispatch_midi(msg, voices, voice_ages, voice_age, &current_patch);
             }
 
+            let t0 = read_cycles();
+
             // Signal core 1 to render voices MAX_VOICES/2..MAX_VOICES
             mc_render::RENDER_DONE.store(false, core::sync::atomic::Ordering::Relaxed);
             mc_render::RENDER_START.store(true, core::sync::atomic::Ordering::Release);
@@ -1567,6 +1613,12 @@ async fn ble_midi_pwm_synth(
                 let duty = (soft * 512.0 + 512.5) as i32;
                 duties[i] = usat::<10>(duty) as u16;
             }
+
+            // Store render cycles for CPU monitoring
+            mc_render::RENDER_CYCLES.store(
+                read_cycles().wrapping_sub(t0),
+                core::sync::atomic::Ordering::Relaxed,
+            );
 
             // Wait for DMA buffer, yield to let BLE tasks run
             while !dma_audio::poll_and_check() {

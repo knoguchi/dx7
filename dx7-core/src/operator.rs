@@ -125,7 +125,7 @@ impl FmOpParams {
 /// 5. Apply sign from phase quadrant
 ///
 /// Output range: approximately [-2^26, +2^26].
-#[inline]
+#[inline(always)]
 pub fn log_sin(phase: i32, env: u16) -> i32 {
     // Step 1-2: log-sine lookup + envelope attenuation (both in log domain)
     let combined = tables::sin_log((phase >> 12) as u16).wrapping_add(env);

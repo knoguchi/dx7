@@ -40,7 +40,7 @@ static mut FREQLUT: *const i32 = core::ptr::null();
 
 /// RAM-resident copies of hot lookup tables (copied from flash at init).
 /// On embedded targets, flash XIP cache misses make const table lookups slow.
-static mut SINLOG_RAM: [u16; 1024] = [0; 1024];
+static mut SINLOG_FULL: [u16; 4096] = [0; 4096];
 static mut SINEXP_RAM: [u16; 1024] = [0; 1024];
 static mut FREQLUT_RAM: [i32; 1025] = [0; 1025];
 
@@ -50,8 +50,14 @@ static mut FREQLUT_RAM: [i32; 1025] = [0; 1025];
 /// Only 44100 and 48000 Hz are supported.
 pub fn init_tables(sample_rate: u32) {
     unsafe {
-        // Copy hot tables to RAM for fast access on embedded targets
-        SINLOG_RAM.copy_from_slice(&generated_tables::SINLOG_TABLE);
+        // Expand quarter-wave SINLOG to full-wave (4096 entries) for branchless lookup
+        for i in 0..1024 {
+            let s = generated_tables::SINLOG_TABLE[i];
+            SINLOG_FULL[i] = s;                        // Q0: sin(0..pi/2)
+            SINLOG_FULL[1024 + i] = generated_tables::SINLOG_TABLE[i ^ 0x3FF]; // Q1: sin(pi/2..pi)
+            SINLOG_FULL[2048 + i] = s | 0x8000;        // Q2: -sin(0..pi/2)
+            SINLOG_FULL[3072 + i] = generated_tables::SINLOG_TABLE[i ^ 0x3FF] | 0x8000; // Q3: -sin(pi/2..pi)
+        }
         SINEXP_RAM.copy_from_slice(&generated_tables::SINEXP_TABLE);
 
         match sample_rate {
@@ -145,21 +151,13 @@ pub fn freqlut_lookup(logfreq: i32) -> i32 {
 /// Log-sine lookup with quadrant handling. Input `phi` uses lower 12 bits:
 /// bits 9..0 = table index, bits 11..10 = quadrant. Returns log attenuation
 /// with bit 15 as sign flag.
-#[inline]
+#[inline(always)]
 pub fn sin_log(phi: u16) -> u16 {
-    let index = (phi & 0x3FF) as usize;
-    unsafe {
-        match (phi >> 10) & 3 {
-            0 => SINLOG_RAM[index],
-            1 => SINLOG_RAM[index ^ 0x3FF],
-            2 => SINLOG_RAM[index] | 0x8000,
-            _ => SINLOG_RAM[index ^ 0x3FF] | 0x8000,
-        }
-    }
+    unsafe { SINLOG_FULL[(phi & 0xFFF) as usize] }
 }
 
 /// Exp table lookup: converts log-attenuation back to linear. Returns mantissa (0..4095).
-#[inline]
+#[inline(always)]
 pub fn sin_exp(index: u16) -> u16 {
     unsafe { SINEXP_RAM[(index & 0x3FF) as usize] }
 }
