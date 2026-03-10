@@ -1,18 +1,21 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod ble;
+pub mod drum;
+pub mod gm;
+mod gm_rom;
 pub mod usb;
 
 /// All channel voice MIDI messages.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MidiMessage {
-    NoteOff { note: u8, velocity: u8 },
-    NoteOn { note: u8, velocity: u8 },
-    PolyPressure { note: u8, pressure: u8 },
-    ControlChange { controller: u8, value: u8 },
-    ProgramChange { program: u8 },
-    ChannelPressure { pressure: u8 },
-    PitchBend { value: u16 },
+    NoteOff { channel: u8, note: u8, velocity: u8 },
+    NoteOn { channel: u8, note: u8, velocity: u8 },
+    PolyPressure { channel: u8, note: u8, pressure: u8 },
+    ControlChange { channel: u8, controller: u8, value: u8 },
+    ProgramChange { channel: u8, program: u8 },
+    ChannelPressure { channel: u8, pressure: u8 },
+    PitchBend { channel: u8, value: u16 },
 }
 
 /// Simple lock-free single-producer single-consumer ring buffer for MIDI messages.
@@ -25,7 +28,7 @@ pub struct MidiQueue {
 
 impl MidiQueue {
     pub const fn new() -> Self {
-        const EMPTY: MidiMessage = MidiMessage::NoteOff { note: 0, velocity: 0 };
+        const EMPTY: MidiMessage = MidiMessage::NoteOff { channel: 0, note: 0, velocity: 0 };
         Self {
             buf: [EMPTY; 256],
             head: core::sync::atomic::AtomicUsize::new(0),
@@ -78,20 +81,20 @@ mod tests {
     #[test]
     fn push_pop_round_trip() {
         let q = MidiQueue::new();
-        q.push(MidiMessage::NoteOn { note: 60, velocity: 100 });
-        assert_eq!(q.pop(), Some(MidiMessage::NoteOn { note: 60, velocity: 100 }));
+        q.push(MidiMessage::NoteOn { channel: 0, note: 60, velocity: 100 });
+        assert_eq!(q.pop(), Some(MidiMessage::NoteOn { channel: 0, note: 60, velocity: 100 }));
         assert_eq!(q.pop(), None);
     }
 
     #[test]
     fn fifo_ordering() {
         let q = MidiQueue::new();
-        q.push(MidiMessage::NoteOn { note: 60, velocity: 100 });
-        q.push(MidiMessage::NoteOff { note: 60, velocity: 0 });
-        q.push(MidiMessage::ProgramChange { program: 5 });
-        assert_eq!(q.pop(), Some(MidiMessage::NoteOn { note: 60, velocity: 100 }));
-        assert_eq!(q.pop(), Some(MidiMessage::NoteOff { note: 60, velocity: 0 }));
-        assert_eq!(q.pop(), Some(MidiMessage::ProgramChange { program: 5 }));
+        q.push(MidiMessage::NoteOn { channel: 0, note: 60, velocity: 100 });
+        q.push(MidiMessage::NoteOff { channel: 0, note: 60, velocity: 0 });
+        q.push(MidiMessage::ProgramChange { channel: 0, program: 5 });
+        assert_eq!(q.pop(), Some(MidiMessage::NoteOn { channel: 0, note: 60, velocity: 100 }));
+        assert_eq!(q.pop(), Some(MidiMessage::NoteOff { channel: 0, note: 60, velocity: 0 }));
+        assert_eq!(q.pop(), Some(MidiMessage::ProgramChange { channel: 0, program: 5 }));
         assert_eq!(q.pop(), None);
     }
 
@@ -100,13 +103,13 @@ mod tests {
         let q = MidiQueue::new();
         // Fill all 255 slots (capacity = buf.len() - 1)
         for i in 0..255 {
-            q.push(MidiMessage::NoteOn { note: (i % 128) as u8, velocity: 100 });
+            q.push(MidiMessage::NoteOn { channel: 0, note: (i % 128) as u8, velocity: 100 });
         }
         // This should be silently dropped
-        q.push(MidiMessage::NoteOn { note: 99, velocity: 127 });
+        q.push(MidiMessage::NoteOn { channel: 0, note: 99, velocity: 127 });
         // Drain and verify the 256th message was dropped
         for i in 0..255 {
-            assert_eq!(q.pop(), Some(MidiMessage::NoteOn { note: (i % 128) as u8, velocity: 100 }));
+            assert_eq!(q.pop(), Some(MidiMessage::NoteOn { channel: 0, note: (i % 128) as u8, velocity: 100 }));
         }
         assert_eq!(q.pop(), None);
     }

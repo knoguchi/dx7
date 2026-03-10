@@ -70,11 +70,33 @@ Typical combinations:
 
 ## Architecture
 
-Dual-core rendering with 8-voice polyphony:
-- **Core 0**: embassy async — MIDI input (USB and/or BLE) + renders voices 0-3 + DMA buffer fill
-- **Core 1**: renders voices 4-7 on demand, synchronized via atomic flags
+Dual-core rendering with 10-voice polyphony:
+- **Core 0**: embassy async — MIDI input (USB and/or BLE) + renders voices 0-4 + DMA buffer fill
+- **Core 1**: renders voices 5-9 on demand, synchronized via atomic flags
 
 Audio output uses DMA ping-pong double-buffering: two DMA channels alternate between two buffers, writing PWM duty values at 48 kHz with zero CPU involvement during transfer.
+
+### Synth Modes
+
+The firmware supports two operating modes, switchable at runtime via custom SysEx:
+
+- **DX7 mode** (power-up default): Classic monotimbral operation — one patch for all voices, like a real DX7. Boots with BRASS 1 (ROM1A patch 0). ProgramChange selects from the ROM1A bank (0-31) or a loaded SysEx bank. Pitch bend, mod wheel, and sustain pedal apply globally to all active voices. MIDI receive channel is configurable (default: OMNI).
+
+- **GM mode**: Multitimbral General MIDI operation — per-channel patches from the GM voice map, drums on channel 10 (MIDI ch 9). Intended for MIDI file playback.
+
+### Custom SysEx Commands
+
+Configure the synth from the host (Pico has no UI). Manufacturer ID `7D` = educational/non-commercial.
+
+| SysEx Message           | Description                              |
+|-------------------------|------------------------------------------|
+| `F0 7D 01 00 F7`       | Switch to DX7 mode (monotimbral)         |
+| `F0 7D 01 01 F7`       | Switch to GM mode (multitimbral)         |
+| `F0 7D 02 <ch> F7`     | Set MIDI receive channel (DX7 mode only) |
+
+Channel values: `00`-`0F` = channel 1-16, `7F` = OMNI (respond to all channels).
+
+Mode switches kill all active voices to prevent stuck notes.
 
 ### BLE MIDI
 
@@ -82,10 +104,11 @@ On the Pico 2 W, the CYW43 WiFi/BLE chip provides Bluetooth Low Energy. The firm
 
 ### Voice Management
 
-- Polyphonic voice allocation with oldest-voice stealing
+- 10-voice polyphony across 2 cores (5 per core)
+- Steal priority: inactive > sustain-held > released > oldest active
 - Same-note deduplication prevents stuck notes on retrigger
 - CC 120 (All Sound Off) and CC 123 (All Notes Off) release all voices
-- SysEx bank reception for loading custom patches
+- SysEx bank reception for loading custom DX7 32-voice bulk dumps
 
 ## Pin Mapping
 
@@ -116,5 +139,5 @@ Cutoff frequency: ~1.6 kHz (adequate for demo; use I2S + DAC for quality audio).
 
 - RP2350: 200 MHz Cortex-M33, 520 KB SRAM
 - Block size: 64 samples @ 48 kHz = 1333 us deadline
-- 8 voices across 2 cores (4 per core)
+- 10 voices across 2 cores (5 per core)
 - DMA audio output with zero CPU overhead during transfer

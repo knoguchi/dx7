@@ -12,8 +12,28 @@ use embassy_hal_internal::Peri;
 use dx7_core::voice::Voice;
 use dx7_core::load_rom1a_voice;
 use dx7_core::tables::N;
+use core::sync::atomic::{AtomicU8, Ordering};
 
-const MAX_VOICES: usize = 16;
+const MAX_VOICES: usize = 10;
+const NUM_CHANNELS: usize = 16;
+
+/// 0 = DX7 monotimbral (power-up default), 1 = GM multitimbral
+static SYNTH_MODE: AtomicU8 = AtomicU8::new(0);
+/// MIDI receive channel for DX7 mode: 0x00-0x0F = ch 1-16, 0x7F = OMNI
+static MIDI_CHANNEL: AtomicU8 = AtomicU8::new(0x7F);
+
+struct ChannelState {
+    patch: dx7_core::DxVoice,
+    pitch_bend: i32,
+    mod_wheel: i32,
+    sustain: bool,
+}
+
+impl ChannelState {
+    fn new(patch: dx7_core::DxVoice) -> Self {
+        Self { patch, pitch_bend: 0, mod_wheel: 0, sustain: false }
+    }
+}
 
 const SAMPLE_RATE: u32 = 48000;
 const CPU_HZ: u32 = 200_000_000;
@@ -326,8 +346,8 @@ mod mc_render {
     /// Core 1 sets RENDER_DONE=true when finished. Core 0 checks before combining.
     pub static RENDER_DONE: AtomicBool = AtomicBool::new(true);
 
-    /// Render cycles for the most recent block (written by core 0 render loop).
-    pub static RENDER_CYCLES: core::sync::atomic::AtomicU32 =
+    /// Peak render cycles since last CPU meter read (reset-on-read).
+    pub static RENDER_CYCLES_PEAK: core::sync::atomic::AtomicU32 =
         core::sync::atomic::AtomicU32::new(0);
 
     /// Core 1 entry: render voices MAX_VOICES/2..MAX_VOICES on demand.
@@ -379,20 +399,58 @@ fn dispatch_midi(
     voices: &mut [dx7_core::voice::Voice],
     voice_ages: &mut [u32],
     voice_age: &mut u32,
-    current_patch: &dx7_core::DxVoice,
+    channels: &mut [ChannelState; NUM_CHANNELS],
+    sysex_bank: Option<&[u8; 4096]>,
+    synth_mode: u8,
 ) {
     use dx7_core::voice::VoiceState;
+
+    // DX7 mode: channel filter
+    if synth_mode == 0 {
+        let midi_ch = MIDI_CHANNEL.load(Ordering::Acquire);
+        if midi_ch != 0x7F {
+            // Not OMNI — check channel
+            let msg_ch = match &msg {
+                dx7_midi::MidiMessage::NoteOn { channel, .. } => *channel,
+                dx7_midi::MidiMessage::NoteOff { channel, .. } => *channel,
+                dx7_midi::MidiMessage::PitchBend { channel, .. } => *channel,
+                dx7_midi::MidiMessage::ControlChange { channel, .. } => *channel,
+                dx7_midi::MidiMessage::ProgramChange { channel, .. } => *channel,
+                _ => return,
+            };
+            if msg_ch != midi_ch {
+                return;
+            }
+        }
+    }
+
     match msg {
-        dx7_midi::MidiMessage::NoteOn { note, velocity } => {
-            // Release any existing voice with the same note (prevents duplicates)
-            for v in voices.iter_mut() {
-                if v.note == note && !v.is_finished() {
-                    v.note_off();
+        dx7_midi::MidiMessage::NoteOn { channel, note, velocity } => {
+            if synth_mode == 0 {
+                // DX7 mode: match by note only (ignore channel for dedup)
+                for v in voices.iter_mut() {
+                    if v.note == note && !v.is_finished() {
+                        v.state = VoiceState::Inactive;
+                    }
+                }
+            } else {
+                // GM mode: match by (note, channel)
+                for v in voices.iter_mut() {
+                    if v.note == note && v.channel == channel && !v.is_finished() {
+                        v.state = VoiceState::Inactive;
+                    }
                 }
             }
             *voice_age += 1;
             let n = voices.len();
-            let slot = voices.iter().position(|v| v.is_finished())
+            // Steal priority: inactive > sustain-held > released > oldest active
+            let slot = voices.iter().position(|v| v.state == VoiceState::Inactive)
+                .or_else(|| {
+                    voices.iter().enumerate()
+                        .filter(|(_, v)| v.sustain_held)
+                        .min_by_key(|(i, _)| voice_ages[*i])
+                        .map(|(i, _)| i)
+                })
                 .or_else(|| {
                     voices.iter().enumerate()
                         .filter(|(_, v)| v.state == VoiceState::Released)
@@ -402,22 +460,181 @@ fn dispatch_midi(
                 .unwrap_or_else(|| {
                     (0..n).min_by_key(|&i| voice_ages[i]).unwrap()
                 });
-            voices[slot].note_on(current_patch, note, velocity);
+            voices[slot].state = VoiceState::Inactive;
+            let patch;
+            if synth_mode == 0 {
+                // DX7 mode: always use channels[0].patch, no drum mapping
+                patch = channels[0].patch.clone();
+            } else if channel == 9 {
+                // GM mode: channel 9 = drums
+                if let Some(dp) = dx7_midi::drum::drum_voice(note) {
+                    patch = dp;
+                } else {
+                    return;
+                }
+            } else {
+                patch = channels[channel as usize].patch.clone();
+            }
+            voices[slot].note_on(&patch, note, velocity);
+            voices[slot].channel = channel;
+            voices[slot].sustain_held = false;
+            if synth_mode == 0 {
+                // DX7 mode: use global (ch 0) bend/mod
+                voices[slot].pitch_bend = channels[0].pitch_bend;
+                voices[slot].mod_wheel = channels[0].mod_wheel;
+            } else {
+                voices[slot].pitch_bend = channels[channel as usize].pitch_bend;
+                voices[slot].mod_wheel = channels[channel as usize].mod_wheel;
+            }
             voice_ages[slot] = *voice_age;
         }
-        dx7_midi::MidiMessage::NoteOff { note, .. } => {
-            for v in voices.iter_mut() {
-                if v.note == note && !v.is_finished() {
-                    v.note_off();
+        dx7_midi::MidiMessage::NoteOff { channel, note, .. } => {
+            if synth_mode == 0 {
+                // DX7 mode: match by note only
+                for v in voices.iter_mut() {
+                    if v.note == note && !v.is_finished() {
+                        if channels[0].sustain {
+                            v.sustain_held = true;
+                        } else {
+                            v.note_off();
+                        }
+                    }
+                }
+            } else {
+                let ch = channel as usize;
+                for v in voices.iter_mut() {
+                    if v.note == note && v.channel == channel && !v.is_finished() {
+                        if channels[ch].sustain {
+                            v.sustain_held = true;
+                        } else {
+                            v.note_off();
+                        }
+                    }
                 }
             }
         }
-        dx7_midi::MidiMessage::ControlChange { controller, .. } => {
-            if controller == 120 || controller == 123 {
+        dx7_midi::MidiMessage::PitchBend { channel, value } => {
+            let bend_signed = value as i32 - 8192;
+            let bend_range_semitones = 12;
+            let bend = (bend_signed * bend_range_semitones * 256) / 8192;
+            if synth_mode == 0 {
+                // DX7 mode: apply globally to ALL active voices
+                channels[0].pitch_bend = bend;
                 for v in voices.iter_mut() {
                     if !v.is_finished() {
-                        v.note_off();
+                        v.pitch_bend = bend;
                     }
+                }
+            } else {
+                let ch = channel as usize;
+                channels[ch].pitch_bend = bend;
+                for v in voices.iter_mut() {
+                    if v.channel == channel && !v.is_finished() {
+                        v.pitch_bend = bend;
+                    }
+                }
+            }
+        }
+        dx7_midi::MidiMessage::ControlChange { channel, controller, value } => {
+            match controller {
+                1 => {
+                    let mw = value as i32;
+                    if synth_mode == 0 {
+                        // DX7 mode: apply globally
+                        channels[0].mod_wheel = mw;
+                        for v in voices.iter_mut() {
+                            if !v.is_finished() {
+                                v.mod_wheel = mw;
+                            }
+                        }
+                    } else {
+                        let ch = channel as usize;
+                        channels[ch].mod_wheel = mw;
+                        for v in voices.iter_mut() {
+                            if v.channel == channel && !v.is_finished() {
+                                v.mod_wheel = mw;
+                            }
+                        }
+                    }
+                }
+                64 => {
+                    let on = value >= 64;
+                    if synth_mode == 0 {
+                        // DX7 mode: global sustain
+                        channels[0].sustain = on;
+                        if !on {
+                            for v in voices.iter_mut() {
+                                if v.sustain_held {
+                                    v.sustain_held = false;
+                                    v.note_off();
+                                }
+                            }
+                        }
+                    } else {
+                        let ch = channel as usize;
+                        channels[ch].sustain = on;
+                        if !on {
+                            for v in voices.iter_mut() {
+                                if v.channel == channel && v.sustain_held {
+                                    v.sustain_held = false;
+                                    v.note_off();
+                                }
+                            }
+                        }
+                    }
+                }
+                120 | 123 => {
+                    if synth_mode == 0 {
+                        // DX7 mode: kill ALL voices
+                        for v in voices.iter_mut() {
+                            if !v.is_finished() {
+                                v.note_off();
+                            }
+                        }
+                    } else {
+                        for v in voices.iter_mut() {
+                            if v.channel == channel && !v.is_finished() {
+                                v.note_off();
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        dx7_midi::MidiMessage::ProgramChange { channel, program } => {
+            if synth_mode == 0 {
+                // DX7 mode: update channels[0].patch (global)
+                if let Some(bank) = sysex_bank {
+                    let idx = program as usize;
+                    if idx < 32 {
+                        let start = idx * 128;
+                        let mut voice_data = [0u8; 128];
+                        voice_data.copy_from_slice(&bank[start..start + 128]);
+                        channels[0].patch = dx7_core::DxVoice::from_packed(&voice_data);
+                        defmt::info!("DX7 sysex patch {}", idx);
+                    }
+                } else if let Some(p) = dx7_core::load_rom1a_voice(program as usize) {
+                    channels[0].patch = p;
+                    defmt::info!("DX7 ROM1A patch {}", program);
+                } else {
+                    defmt::info!("DX7 patch {} out of range", program);
+                }
+            } else {
+                // GM mode: per-channel patch
+                let ch = channel as usize;
+                if let Some(bank) = sysex_bank {
+                    let idx = program as usize;
+                    if idx < 32 {
+                        let start = idx * 128;
+                        let mut voice_data = [0u8; 128];
+                        voice_data.copy_from_slice(&bank[start..start + 128]);
+                        channels[ch].patch = dx7_core::DxVoice::from_packed(&voice_data);
+                        defmt::info!("Ch{} loaded sysex patch {}", ch, idx);
+                    }
+                } else {
+                    channels[ch].patch = dx7_midi::gm::gm_voice(program);
+                    defmt::info!("Ch{} GM program {}", ch, program);
                 }
             }
         }
@@ -467,7 +684,7 @@ async fn main(_spawner: Spawner) {
     dx7_core::pitchenv::init_pitchenv(SAMPLE_RATE);
 
     // === Benchmark ===
-    let patch = load_rom1a_voice(10).unwrap();
+    let patch = load_rom1a_voice(0).unwrap();
     let mut voice = Voice::new();
     voice.note_on(&patch, 36, 100);
     let mut output = [0i32; N];
@@ -665,7 +882,7 @@ async fn usb_midi_pwm_synth(
     let cpu_meter = async {
         loop {
             embassy_time::Timer::after_millis(500).await;
-            let cycles = mc_render::RENDER_CYCLES.load(core::sync::atomic::Ordering::Relaxed);
+            let cycles = mc_render::RENDER_CYCLES_PEAK.swap(0, core::sync::atomic::Ordering::Relaxed);
             let pct = ((cycles as u64 * 127) / 266667).min(127) as u8;
             let packet = [0x0B, 0xB0, 119, pct];
             let _ = sender.write_packet(&packet).await;
@@ -714,7 +931,39 @@ async fn usb_midi_pwm_synth(
                                         }
                                         // Process complete SysEx
                                         let len = SYSEX_RX_POS;
-                                        if len == 4104
+                                        if len == 5
+                                            && SYSEX_RX_BUF[0] == 0xF0
+                                            && SYSEX_RX_BUF[1] == 0x7D
+                                            && SYSEX_RX_BUF[4] == 0xF7
+                                        {
+                                            match SYSEX_RX_BUF[2] {
+                                                0x01 => {
+                                                    // Mode switch: 0=DX7, 1=GM
+                                                    let mode = SYSEX_RX_BUF[3];
+                                                    SYNTH_MODE.store(mode, Ordering::Release);
+                                                    info!("Mode: {}", if mode == 0 { "DX7" } else { "GM" });
+                                                    // Kill all voices on mode switch
+                                                    for msg_ch in 0..16u8 {
+                                                        MIDI_QUEUE.push(dx7_midi::MidiMessage::ControlChange {
+                                                            channel: msg_ch, controller: 123, value: 0,
+                                                        });
+                                                    }
+                                                }
+                                                0x02 => {
+                                                    // Set MIDI channel (DX7 mode)
+                                                    let ch = SYSEX_RX_BUF[3];
+                                                    MIDI_CHANNEL.store(ch, Ordering::Release);
+                                                    if ch == 0x7F {
+                                                        info!("MIDI channel: OMNI");
+                                                    } else {
+                                                        info!("MIDI channel: {}", ch + 1);
+                                                    }
+                                                }
+                                                _ => {
+                                                    info!("SysEx: unknown cmd 0x{:02X}", SYSEX_RX_BUF[2]);
+                                                }
+                                            }
+                                        } else if len == 4104
                                             && SYSEX_RX_BUF[0] == 0xF0
                                             && SYSEX_RX_BUF[1] == 0x43
                                             && (SYSEX_RX_BUF[2] & 0xF0) == 0x00
@@ -770,7 +1019,8 @@ async fn usb_midi_pwm_synth(
         let voice_ages = unsafe { &mut mc_render::VOICE_AGES };
         #[allow(static_mut_refs)]
         let voice_age = unsafe { &mut mc_render::VOICE_AGE };
-        let mut current_patch = load_rom1a_voice(0).unwrap();
+        let init_patch = load_rom1a_voice(0).unwrap();
+        let mut channels: [ChannelState; NUM_CHANNELS] = core::array::from_fn(|_| ChannelState::new(init_patch.clone()));
         let mut output = [0i32; N];
         let mut duties = [0u16; N];
         // Static to avoid async stack pressure (~96 bytes)
@@ -799,30 +1049,14 @@ async fn usb_midi_pwm_synth(
         loop {
             // Drain MIDI queue
             while let Some(msg) = MIDI_QUEUE.pop() {
-                if let dx7_midi::MidiMessage::ProgramChange { program } = msg {
-                    if program == 32 {
-                        current_patch = dx7_core::DxVoice::init_voice();
-                    } else if SYSEX_BANK_LOADED.load(core::sync::atomic::Ordering::Acquire)
-                    {
-                        let idx = program as usize;
-                        if idx < 32 {
-                            let start = idx * 128;
-                            let mut voice_data = [0u8; 128];
-                            #[allow(static_mut_refs)]
-                            unsafe {
-                                voice_data.copy_from_slice(
-                                    &SYSEX_BANK[start..start + 128],
-                                );
-                            }
-                            current_patch =
-                                dx7_core::DxVoice::from_packed(&voice_data);
-                            info!("Loaded sysex patch {}", idx);
-                        }
-                    } else if let Some(p) = load_rom1a_voice(program as usize) {
-                        current_patch = p;
-                    }
-                }
-                dispatch_midi(msg, voices, voice_ages, voice_age, &current_patch);
+                let sysex_bank = if SYSEX_BANK_LOADED.load(core::sync::atomic::Ordering::Acquire) {
+                    #[allow(static_mut_refs)]
+                    Some(unsafe { &SYSEX_BANK })
+                } else {
+                    None
+                };
+                dispatch_midi(msg, voices, voice_ages, voice_age, &mut channels, sysex_bank,
+                    SYNTH_MODE.load(Ordering::Acquire));
             }
 
             let t0 = read_cycles();
@@ -858,7 +1092,7 @@ async fn usb_midi_pwm_synth(
             for i in 0..N {
                 // Convert i32 to f32. Single voice peaks ±2^26.
                 // Divide by 2^26 * 3 for 8-voice mix — soft-clip handles peaks.
-                let sample_f32 = output[i] as f32 / (67108864.0 * 3.0);
+                let sample_f32 = output[i] as f32 / (67108864.0 * MAX_VOICES as f32);
                 let filtered = filter.process(sample_f32);
                 // Soft clip: tanh approximation (smooth limiting, no harsh distortion)
                 let x = filtered;
@@ -875,7 +1109,7 @@ async fn usb_midi_pwm_synth(
             }
 
             // Store render cycles for async CPU meter (excludes DMA wait)
-            mc_render::RENDER_CYCLES.store(
+            mc_render::RENDER_CYCLES_PEAK.fetch_max(
                 read_cycles().wrapping_sub(t0),
                 core::sync::atomic::Ordering::Relaxed,
             );
@@ -1024,7 +1258,7 @@ async fn usb_ble_midi_pwm_synth(
     let cpu_meter = async {
         loop {
             embassy_time::Timer::after_millis(500).await;
-            let cycles = mc_render::RENDER_CYCLES.load(core::sync::atomic::Ordering::Relaxed);
+            let cycles = mc_render::RENDER_CYCLES_PEAK.swap(0, core::sync::atomic::Ordering::Relaxed);
             // Budget: 64 samples at 48kHz = 266667 cycles at 200MHz
             let pct = ((cycles as u64 * 127) / 266667).min(127) as u8;
             // USB MIDI packet: CIN=0x0B (CC), channel 1, CC#119, value
@@ -1072,7 +1306,36 @@ async fn usb_ble_midi_pwm_synth(
                                             }
                                         }
                                         let len = SYSEX_RX_POS;
-                                        if len == 4104
+                                        if len == 5
+                                            && SYSEX_RX_BUF[0] == 0xF0
+                                            && SYSEX_RX_BUF[1] == 0x7D
+                                            && SYSEX_RX_BUF[4] == 0xF7
+                                        {
+                                            match SYSEX_RX_BUF[2] {
+                                                0x01 => {
+                                                    let mode = SYSEX_RX_BUF[3];
+                                                    SYNTH_MODE.store(mode, Ordering::Release);
+                                                    info!("Mode: {}", if mode == 0 { "DX7" } else { "GM" });
+                                                    for msg_ch in 0..16u8 {
+                                                        MIDI_QUEUE.push(dx7_midi::MidiMessage::ControlChange {
+                                                            channel: msg_ch, controller: 123, value: 0,
+                                                        });
+                                                    }
+                                                }
+                                                0x02 => {
+                                                    let ch = SYSEX_RX_BUF[3];
+                                                    MIDI_CHANNEL.store(ch, Ordering::Release);
+                                                    if ch == 0x7F {
+                                                        info!("MIDI channel: OMNI");
+                                                    } else {
+                                                        info!("MIDI channel: {}", ch + 1);
+                                                    }
+                                                }
+                                                _ => {
+                                                    info!("SysEx: unknown cmd 0x{:02X}", SYSEX_RX_BUF[2]);
+                                                }
+                                            }
+                                        } else if len == 4104
                                             && SYSEX_RX_BUF[0] == 0xF0
                                             && SYSEX_RX_BUF[1] == 0x43
                                             && (SYSEX_RX_BUF[2] & 0xF0) == 0x00
@@ -1217,7 +1480,8 @@ async fn usb_ble_midi_pwm_synth(
             let voice_ages = unsafe { &mut mc_render::VOICE_AGES };
             #[allow(static_mut_refs)]
             let voice_age = unsafe { &mut mc_render::VOICE_AGE };
-            let mut current_patch = load_rom1a_voice(0).unwrap();
+            let init_patch = load_rom1a_voice(0).unwrap();
+            let mut channels: [ChannelState; NUM_CHANNELS] = core::array::from_fn(|_| ChannelState::new(init_patch.clone()));
             let mut output = [0i32; N];
             let mut duties = [0u16; N];
             static mut FILTER: OutputFilterF32 = OutputFilterF32 {
@@ -1244,29 +1508,14 @@ async fn usb_ble_midi_pwm_synth(
             loop {
                 // Drain MIDI queue (fed by both USB and BLE)
                 while let Some(msg) = MIDI_QUEUE.pop() {
-                    if let dx7_midi::MidiMessage::ProgramChange { program } = msg {
-                        if program == 32 {
-                            current_patch = dx7_core::DxVoice::init_voice();
-                        } else if SYSEX_BANK_LOADED.load(core::sync::atomic::Ordering::Acquire) {
-                            let idx = program as usize;
-                            if idx < 32 {
-                                let start = idx * 128;
-                                let mut voice_data = [0u8; 128];
-                                #[allow(static_mut_refs)]
-                                unsafe {
-                                    voice_data.copy_from_slice(
-                                        &SYSEX_BANK[start..start + 128],
-                                    );
-                                }
-                                current_patch =
-                                    dx7_core::DxVoice::from_packed(&voice_data);
-                                info!("Loaded sysex patch {}", idx);
-                            }
-                        } else if let Some(p) = load_rom1a_voice(program as usize) {
-                            current_patch = p;
-                        }
-                    }
-                    dispatch_midi(msg, voices, voice_ages, voice_age, &current_patch);
+                    let sysex_bank = if SYSEX_BANK_LOADED.load(core::sync::atomic::Ordering::Acquire) {
+                        #[allow(static_mut_refs)]
+                        Some(unsafe { &SYSEX_BANK })
+                    } else {
+                        None
+                    };
+                    dispatch_midi(msg, voices, voice_ages, voice_age, &mut channels, sysex_bank,
+                        SYNTH_MODE.load(Ordering::Acquire));
                 }
 
                 let t0 = read_cycles();
@@ -1297,7 +1546,7 @@ async fn usb_ble_midi_pwm_synth(
                 }
 
                 for i in 0..N {
-                    let sample_f32 = output[i] as f32 / (67108864.0 * 3.0);
+                    let sample_f32 = output[i] as f32 / (67108864.0 * MAX_VOICES as f32);
                     let filtered = filter.process(sample_f32);
                     let x = filtered;
                     let soft = if x > 1.0 {
@@ -1312,7 +1561,7 @@ async fn usb_ble_midi_pwm_synth(
                 }
 
                 // Store render cycles for async CPU meter (excludes DMA wait)
-                mc_render::RENDER_CYCLES.store(
+                mc_render::RENDER_CYCLES_PEAK.fetch_max(
                     read_cycles().wrapping_sub(t0),
                     core::sync::atomic::Ordering::Relaxed,
                 );
@@ -1532,7 +1781,8 @@ async fn ble_midi_pwm_synth(
         let voice_ages = unsafe { &mut mc_render::VOICE_AGES };
         #[allow(static_mut_refs)]
         let voice_age = unsafe { &mut mc_render::VOICE_AGE };
-        let mut current_patch = load_rom1a_voice(0).unwrap();
+        let init_patch = load_rom1a_voice(0).unwrap();
+        let mut channels: [ChannelState; NUM_CHANNELS] = core::array::from_fn(|_| ChannelState::new(init_patch.clone()));
         let mut output = [0i32; N];
         let mut duties = [0u16; N];
         static mut FILTER: OutputFilterF32 = OutputFilterF32 {
@@ -1559,14 +1809,8 @@ async fn ble_midi_pwm_synth(
         loop {
             // Drain MIDI queue
             while let Some(msg) = MIDI_QUEUE.pop() {
-                if let dx7_midi::MidiMessage::ProgramChange { program } = msg {
-                    if program == 32 {
-                        current_patch = dx7_core::DxVoice::init_voice();
-                    } else if let Some(p) = load_rom1a_voice(program as usize) {
-                        current_patch = p;
-                    }
-                }
-                dispatch_midi(msg, voices, voice_ages, voice_age, &current_patch);
+                dispatch_midi(msg, voices, voice_ages, voice_age, &mut channels, None,
+                    SYNTH_MODE.load(Ordering::Acquire));
             }
 
             let t0 = read_cycles();
@@ -1600,7 +1844,7 @@ async fn ble_midi_pwm_synth(
 
             // Convert to f32, filter, soft-clip, scale to 10-bit PWM duty
             for i in 0..N {
-                let sample_f32 = output[i] as f32 / (67108864.0 * 3.0);
+                let sample_f32 = output[i] as f32 / (67108864.0 * MAX_VOICES as f32);
                 let filtered = filter.process(sample_f32);
                 let x = filtered;
                 let soft = if x > 1.0 {
@@ -1615,7 +1859,7 @@ async fn ble_midi_pwm_synth(
             }
 
             // Store render cycles for CPU monitoring
-            mc_render::RENDER_CYCLES.store(
+            mc_render::RENDER_CYCLES_PEAK.fetch_max(
                 read_cycles().wrapping_sub(t0),
                 core::sync::atomic::Ordering::Relaxed,
             );

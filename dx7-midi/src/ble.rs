@@ -57,9 +57,11 @@ pub fn parse_ble_midi_packet(data: &[u8], queue: &MidiQueue) {
 }
 
 fn try_parse(status: u8, data: &[u8], queue: &MidiQueue) -> Option<usize> {
+    let channel = status & 0x0F;
     match status & 0xF0 {
         0x80 if data.len() >= 2 => {
             queue.push(MidiMessage::NoteOff {
+                channel,
                 note: data[0] & 0x7F,
                 velocity: data[1] & 0x7F,
             });
@@ -69,14 +71,15 @@ fn try_parse(status: u8, data: &[u8], queue: &MidiQueue) -> Option<usize> {
             let note = data[0] & 0x7F;
             let vel = data[1] & 0x7F;
             if vel == 0 {
-                queue.push(MidiMessage::NoteOff { note, velocity: 0 });
+                queue.push(MidiMessage::NoteOff { channel, note, velocity: 0 });
             } else {
-                queue.push(MidiMessage::NoteOn { note, velocity: vel });
+                queue.push(MidiMessage::NoteOn { channel, note, velocity: vel });
             }
             Some(2)
         }
         0xA0 if data.len() >= 2 => {
             queue.push(MidiMessage::PolyPressure {
+                channel,
                 note: data[0] & 0x7F,
                 pressure: data[1] & 0x7F,
             });
@@ -84,23 +87,24 @@ fn try_parse(status: u8, data: &[u8], queue: &MidiQueue) -> Option<usize> {
         }
         0xB0 if data.len() >= 2 => {
             queue.push(MidiMessage::ControlChange {
+                channel,
                 controller: data[0] & 0x7F,
                 value: data[1] & 0x7F,
             });
             Some(2)
         }
         0xC0 if !data.is_empty() => {
-            queue.push(MidiMessage::ProgramChange { program: data[0] & 0x7F });
+            queue.push(MidiMessage::ProgramChange { channel, program: data[0] & 0x7F });
             Some(1)
         }
         0xD0 if !data.is_empty() => {
-            queue.push(MidiMessage::ChannelPressure { pressure: data[0] & 0x7F });
+            queue.push(MidiMessage::ChannelPressure { channel, pressure: data[0] & 0x7F });
             Some(1)
         }
         0xE0 if data.len() >= 2 => {
             let lsb = (data[0] & 0x7F) as u16;
             let msb = (data[1] & 0x7F) as u16;
-            queue.push(MidiMessage::PitchBend { value: (msb << 7) | lsb });
+            queue.push(MidiMessage::PitchBend { channel, value: (msb << 7) | lsb });
             Some(2)
         }
         _ => None,
@@ -131,58 +135,58 @@ mod tests {
     fn note_on() {
         // header, timestamp, status 0x90, note 60, velocity 100
         let msgs = collect(&[0x80, 0x80, 0x90, 0x3C, 0x64]);
-        assert_eq!(msgs, [MidiMessage::NoteOn { note: 60, velocity: 100 }]);
+        assert_eq!(msgs, [MidiMessage::NoteOn { channel: 0, note: 60, velocity: 100 }]);
     }
 
     #[test]
     fn note_on_velocity_zero_becomes_note_off() {
         let msgs = collect(&[0x80, 0x80, 0x90, 0x3C, 0x00]);
-        assert_eq!(msgs, [MidiMessage::NoteOff { note: 60, velocity: 0 }]);
+        assert_eq!(msgs, [MidiMessage::NoteOff { channel: 0, note: 60, velocity: 0 }]);
     }
 
     #[test]
     fn note_off() {
         let msgs = collect(&[0x80, 0x80, 0x80, 0x3C, 0x40]);
-        assert_eq!(msgs, [MidiMessage::NoteOff { note: 60, velocity: 64 }]);
+        assert_eq!(msgs, [MidiMessage::NoteOff { channel: 0, note: 60, velocity: 64 }]);
     }
 
     #[test]
     fn poly_pressure() {
         let msgs = collect(&[0x80, 0x80, 0xA0, 0x3C, 0x50]);
-        assert_eq!(msgs, [MidiMessage::PolyPressure { note: 60, pressure: 80 }]);
+        assert_eq!(msgs, [MidiMessage::PolyPressure { channel: 0, note: 60, pressure: 80 }]);
     }
 
     #[test]
     fn control_change() {
         // CC#1 (mod wheel) value 64
         let msgs = collect(&[0x80, 0x80, 0xB0, 0x01, 0x40]);
-        assert_eq!(msgs, [MidiMessage::ControlChange { controller: 1, value: 64 }]);
+        assert_eq!(msgs, [MidiMessage::ControlChange { channel: 0, controller: 1, value: 64 }]);
     }
 
     #[test]
     fn program_change() {
         let msgs = collect(&[0x80, 0x80, 0xC0, 0x05]);
-        assert_eq!(msgs, [MidiMessage::ProgramChange { program: 5 }]);
+        assert_eq!(msgs, [MidiMessage::ProgramChange { channel: 0, program: 5 }]);
     }
 
     #[test]
     fn channel_pressure() {
         let msgs = collect(&[0x80, 0x80, 0xD0, 0x60]);
-        assert_eq!(msgs, [MidiMessage::ChannelPressure { pressure: 96 }]);
+        assert_eq!(msgs, [MidiMessage::ChannelPressure { channel: 0, pressure: 96 }]);
     }
 
     #[test]
     fn pitch_bend() {
         // Pitch bend center = 0x2000 (MSB=0x40, LSB=0x00)
         let msgs = collect(&[0x80, 0x80, 0xE0, 0x00, 0x40]);
-        assert_eq!(msgs, [MidiMessage::PitchBend { value: 0x2000 }]);
+        assert_eq!(msgs, [MidiMessage::PitchBend { channel: 0, value: 0x2000 }]);
     }
 
     #[test]
     fn pitch_bend_max() {
         // Pitch bend max = 0x3FFF (MSB=0x7F, LSB=0x7F)
         let msgs = collect(&[0x80, 0x80, 0xE0, 0x7F, 0x7F]);
-        assert_eq!(msgs, [MidiMessage::PitchBend { value: 0x3FFF }]);
+        assert_eq!(msgs, [MidiMessage::PitchBend { channel: 0, value: 0x3FFF }]);
     }
 
     #[test]
@@ -194,8 +198,8 @@ mod tests {
             0x80, 0x90, 0x40, 0x50, // note on E4
         ]);
         assert_eq!(msgs, [
-            MidiMessage::NoteOn { note: 60, velocity: 100 },
-            MidiMessage::NoteOn { note: 64, velocity: 80 },
+            MidiMessage::NoteOn { channel: 0, note: 60, velocity: 100 },
+            MidiMessage::NoteOn { channel: 0, note: 64, velocity: 80 },
         ]);
     }
 
@@ -208,8 +212,8 @@ mod tests {
             0x80, 0x40, 0x50,        // running status: note on E4
         ]);
         assert_eq!(msgs, [
-            MidiMessage::NoteOn { note: 60, velocity: 100 },
-            MidiMessage::NoteOn { note: 64, velocity: 80 },
+            MidiMessage::NoteOn { channel: 0, note: 60, velocity: 100 },
+            MidiMessage::NoteOn { channel: 0, note: 64, velocity: 80 },
         ]);
     }
 
@@ -221,6 +225,13 @@ mod tests {
             0x80, 0xF0, 0x7E, 0x7F, 0xF7, // SysEx (identity request)
             0x80, 0x90, 0x3C, 0x64,          // note on
         ]);
-        assert_eq!(msgs, [MidiMessage::NoteOn { note: 60, velocity: 100 }]);
+        assert_eq!(msgs, [MidiMessage::NoteOn { channel: 0, note: 60, velocity: 100 }]);
+    }
+
+    #[test]
+    fn channel_extracted() {
+        // Note on channel 5: status = 0x95
+        let msgs = collect(&[0x80, 0x80, 0x95, 0x3C, 0x64]);
+        assert_eq!(msgs, [MidiMessage::NoteOn { channel: 5, note: 60, velocity: 100 }]);
     }
 }

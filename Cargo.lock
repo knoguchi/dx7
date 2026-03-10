@@ -546,6 +546,7 @@ dependencies = [
  "crossterm",
  "dispatch2",
  "dx7-core",
+ "dx7-midi",
  "futures",
  "hound",
  "midir",
@@ -564,6 +565,9 @@ version = "0.1.0"
 [[package]]
 name = "dx7-midi"
 version = "0.1.0"
+dependencies = [
+ "dx7-core",
+]
 
 [[package]]
 name = "either"

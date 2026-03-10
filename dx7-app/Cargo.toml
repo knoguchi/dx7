@@ -15,6 +15,7 @@ rtp-midi = []
 
 [dependencies]
 dx7-core = { path = "../dx7-core", features = ["std"] }
+dx7-midi = { path = "../dx7-midi" }
 cpal = "0.15"
 midir = "0.10"
 hound = "3.5"

@@ -76,7 +76,10 @@ pub enum VoiceState {
 pub struct Voice {
     pub state: VoiceState,
     pub note: u8,
+    pub channel: u8,
     pub velocity: u8,
+    /// True if NoteOff was received but sustain pedal is holding this voice.
+    pub sustain_held: bool,
     pub age: u32,
 
     // Per-operator state
@@ -110,7 +113,9 @@ impl Voice {
         Self {
             state: VoiceState::Inactive,
             note: 0,
+            channel: 0,
             velocity: 0,
+            sustain_held: false,
             age: 0,
             params: [
                 FmOpParams::new(),

@@ -10,7 +10,6 @@ mod audio;
 #[cfg(feature = "bluetooth")]
 mod bluetooth;
 mod gm;
-mod gm_rom;
 mod keyboard;
 mod midi;
 #[cfg(feature = "rtp-midi")]

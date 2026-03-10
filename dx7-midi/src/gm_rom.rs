@@ -8,7 +8,7 @@ use dx7_core::DxVoice;
 /// Programs 32-39 use a custom FM bass patch with harmonic ratios.
 /// Programs 48-51 have boosted attack rates for responsive string ensembles.
 #[rustfmt::skip]
-const GM_ROM_DATA: [[u8; 128]; 128] = [
+pub const GM_ROM_DATA: [[u8; 128]; 128] = [
     [ //   0: Acoustic Grand Piano (PIANO   1)
          99,  0, 25,  0, 99, 75,  0,  0,  0,  0, 10,  0, 53,  0, 82,  2,  0,
          81, 58, 36, 39, 99, 14,  0,  0, 48,  0, 66,  0, 53,  4, 93,  2, 58,

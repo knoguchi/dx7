@@ -222,13 +222,13 @@ async fn ble_midi_synth(bluetooth: esp_hal::peripherals::BT<'static>) -> ! {
             // Process MIDI
             while let Some(msg) = MIDI_QUEUE.pop() {
                 match msg {
-                    dx7_midi::MidiMessage::NoteOn { note, velocity } => {
+                    dx7_midi::MidiMessage::NoteOn { note, velocity, .. } => {
                         voice.note_on(&current_patch, note, velocity);
                     }
                     dx7_midi::MidiMessage::NoteOff { .. } => {
                         voice.note_off();
                     }
-                    dx7_midi::MidiMessage::ProgramChange { program } => {
+                    dx7_midi::MidiMessage::ProgramChange { program, .. } => {
                         if let Some(p) = load_rom1a_voice(program as usize) {
                             current_patch = p;
                         }
