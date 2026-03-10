@@ -586,7 +586,7 @@ async fn usb_midi_pwm_synth(
     let midi = embassy_usb::class::midi::MidiClass::new(&mut builder, 1, 1, 64);
     let mut usb = builder.build();
 
-    let (mut sender, mut receiver) = midi.split();
+    let (_sender, mut receiver) = midi.split();
 
     static MIDI_QUEUE: dx7_midi::MidiQueue = dx7_midi::MidiQueue::new();
 
@@ -723,14 +723,6 @@ async fn usb_midi_pwm_synth(
         #[allow(static_mut_refs)]
         let filter = unsafe { &mut FILTER };
 
-        // CPU utilization tracking
-        let budget_cycles = (N as u32 * CPU_HZ) / SAMPLE_RATE;
-        let blocks_per_sec = SAMPLE_RATE / N as u32;
-        let mut block_count: u32 = 0;
-        let mut peak_cycles: u32 = 0;
-        let mut peak_raw: i32 = 0;      // peak |output[i]| over 1 second
-        let mut peak_duty_off: u16 = 0; // peak |duty - 128| over 1 second
-
         unsafe { dma_audio::init(); }
 
         info!("USB MIDI ready — dual-core, {} voices, DMA audio", MAX_VOICES);
@@ -800,7 +792,6 @@ async fn usb_midi_pwm_synth(
 
             // Render voices 0..MAX_VOICES/2 on core 0
             output.fill(0);
-            let render_start = read_cycles();
             for idx in 0..(MAX_VOICES / 2) {
                 if !voices[idx].is_finished() {
                     let mut voice_buf = [0i32; N];
@@ -810,7 +801,6 @@ async fn usb_midi_pwm_synth(
                     }
                 }
             }
-            let render_cycles = read_cycles().wrapping_sub(render_start);
 
             // Wait for core 1 to finish, yielding to let USB tasks run
             while !mc_render::RENDER_DONE.load(core::sync::atomic::Ordering::Acquire) {
@@ -823,16 +813,8 @@ async fn usb_midi_pwm_synth(
                 output[i] = qadd(output[i], unsafe { mc_render::CORE1_BUF[i] });
             }
 
-            if render_cycles > peak_cycles {
-                peak_cycles = render_cycles;
-            }
-
             // Convert to f32, apply DC blocker + LPF, then scale to 10-bit PWM duty
             for i in 0..N {
-                let raw_abs = output[i].abs();
-                if raw_abs > peak_raw {
-                    peak_raw = raw_abs;
-                }
                 // Convert i32 to f32. Single voice peaks ±2^26.
                 // Divide by 2^26 * 3 for 8-voice mix — soft-clip handles peaks.
                 let sample_f32 = output[i] as f32 / (67108864.0 * 3.0);
@@ -849,10 +831,6 @@ async fn usb_midi_pwm_synth(
                 // Scale to 10-bit PWM: ±1.0 → ±512, center at 512
                 let duty = (soft * 512.0 + 512.5) as i32;
                 duties[i] = usat::<10>(duty) as u16;
-                let off = if duties[i] >= 512 { duties[i] - 512 } else { 512 - duties[i] };
-                if off > peak_duty_off {
-                    peak_duty_off = off;
-                }
             }
 
             // Wait for DMA buffer available, yielding to let USB tasks run
@@ -868,29 +846,6 @@ async fn usb_midi_pwm_synth(
                 dma_audio::buffer_filled();
             }
 
-            // Send diagnostics once per second
-            block_count += 1;
-            if block_count >= blocks_per_sec {
-                let cpu_pct = ((peak_cycles as u64 * 127) / budget_cycles as u64) as u8;
-                let cpu_val = if cpu_pct > 127 { 127 } else { cpu_pct };
-                // CC 119: CPU utilization (0-127)
-                let _ = sender.write_packet(&[0x0B, 0xB0, 0x77, cpu_val]).await;
-                // CC 118: peak duty offset from 512 (0=silence, 127=max swing)
-                let duty_val = ((peak_duty_off as u32 * 127) / 512).min(127) as u8;
-                let _ = sender.write_packet(&[0x0B, 0xB0, 0x76, duty_val]).await;
-                // CC 117: peak raw output (log scale: bits used, 0=silent, 26=max)
-                let raw_bits = if peak_raw == 0 { 0u8 } else { (32 - peak_raw.leading_zeros()) as u8 };
-                // Scale 0-26 range to 0-127
-                let raw_val = ((raw_bits as u16 * 127) / 26).min(127) as u8;
-                let _ = sender.write_packet(&[0x0B, 0xB0, 0x75, raw_val]).await;
-
-                block_count = 0;
-                peak_cycles = 0;
-                peak_raw = 0;
-                peak_duty_off = 0;
-            }
-
-            // Yield to let USB tasks process
             embassy_futures::yield_now().await;
         }
     };
@@ -1010,7 +965,7 @@ async fn usb_ble_midi_pwm_synth(
 
     let midi = embassy_usb::class::midi::MidiClass::new(&mut builder, 1, 1, 64);
     let mut usb = builder.build();
-    let (mut sender, mut receiver) = midi.split();
+    let (_sender, mut receiver) = midi.split();
 
     // Task: CYW43 background driver
     let cyw43_task = runner.run();
@@ -1202,13 +1157,6 @@ async fn usb_ble_midi_pwm_synth(
             #[allow(static_mut_refs)]
             let filter = unsafe { &mut FILTER };
 
-            let budget_cycles = (N as u32 * CPU_HZ) / SAMPLE_RATE;
-            let blocks_per_sec = SAMPLE_RATE / N as u32;
-            let mut block_count: u32 = 0;
-            let mut peak_cycles: u32 = 0;
-            let mut peak_raw: i32 = 0;
-            let mut peak_duty_off: u16 = 0;
-
             unsafe { dma_audio::init(); }
 
             info!("USB+BLE MIDI ready — dual-core, {} voices, DMA audio", MAX_VOICES);
@@ -1273,7 +1221,6 @@ async fn usb_ble_midi_pwm_synth(
 
                 // Render voices 0..MAX_VOICES/2 on core 0
                 output.fill(0);
-                let render_start = read_cycles();
                 for idx in 0..(MAX_VOICES / 2) {
                     if !voices[idx].is_finished() {
                         let mut voice_buf = [0i32; N];
@@ -1283,7 +1230,6 @@ async fn usb_ble_midi_pwm_synth(
                         }
                     }
                 }
-                let render_cycles = read_cycles().wrapping_sub(render_start);
 
                 while !mc_render::RENDER_DONE.load(core::sync::atomic::Ordering::Acquire) {
                     embassy_futures::yield_now().await;
@@ -1294,13 +1240,7 @@ async fn usb_ble_midi_pwm_synth(
                     output[i] = qadd(output[i], unsafe { mc_render::CORE1_BUF[i] });
                 }
 
-                if render_cycles > peak_cycles {
-                    peak_cycles = render_cycles;
-                }
-
                 for i in 0..N {
-                    let raw_abs = output[i].abs();
-                    if raw_abs > peak_raw { peak_raw = raw_abs; }
                     let sample_f32 = output[i] as f32 / (67108864.0 * 3.0);
                     let filtered = filter.process(sample_f32);
                     let x = filtered;
@@ -1313,8 +1253,6 @@ async fn usb_ble_midi_pwm_synth(
                     };
                     let duty = (soft * 512.0 + 512.5) as i32;
                     duties[i] = usat::<10>(duty) as u16;
-                    let off = if duties[i] >= 512 { duties[i] - 512 } else { 512 - duties[i] };
-                    if off > peak_duty_off { peak_duty_off = off; }
                 }
 
                 while !dma_audio::poll_and_check() {
@@ -1326,24 +1264,6 @@ async fn usb_ble_midi_pwm_synth(
                         buf[i] = (duties[i] as u32) << 16;
                     }
                     dma_audio::buffer_filled();
-                }
-
-                // Send diagnostics via USB once per second
-                block_count += 1;
-                if block_count >= blocks_per_sec {
-                    let cpu_pct = ((peak_cycles as u64 * 127) / budget_cycles as u64) as u8;
-                    let cpu_val = if cpu_pct > 127 { 127 } else { cpu_pct };
-                    let _ = sender.write_packet(&[0x0B, 0xB0, 0x77, cpu_val]).await;
-                    let duty_val = ((peak_duty_off as u32 * 127) / 512).min(127) as u8;
-                    let _ = sender.write_packet(&[0x0B, 0xB0, 0x76, duty_val]).await;
-                    let raw_bits = if peak_raw == 0 { 0u8 } else { (32 - peak_raw.leading_zeros()) as u8 };
-                    let raw_val = ((raw_bits as u16 * 127) / 26).min(127) as u8;
-                    let _ = sender.write_packet(&[0x0B, 0xB0, 0x75, raw_val]).await;
-
-                    block_count = 0;
-                    peak_cycles = 0;
-                    peak_raw = 0;
-                    peak_duty_off = 0;
                 }
 
                 embassy_futures::yield_now().await;
@@ -1550,11 +1470,6 @@ async fn ble_midi_pwm_synth(
         #[allow(static_mut_refs)]
         let filter = unsafe { &mut FILTER };
 
-        let budget_cycles = (N as u32 * CPU_HZ) / SAMPLE_RATE;
-        let blocks_per_sec = SAMPLE_RATE / N as u32;
-        let mut block_count: u32 = 0;
-        let mut peak_cycles: u32 = 0;
-
         unsafe { dma_audio::init(); }
 
         info!("BLE MIDI ready — dual-core, {} voices, DMA audio", MAX_VOICES);
@@ -1604,7 +1519,6 @@ async fn ble_midi_pwm_synth(
 
             // Render voices 0..MAX_VOICES/2 on core 0
             output.fill(0);
-            let render_start = read_cycles();
             for idx in 0..(MAX_VOICES / 2) {
                 if !voices[idx].is_finished() {
                     let mut voice_buf = [0i32; N];
@@ -1614,7 +1528,6 @@ async fn ble_midi_pwm_synth(
                     }
                 }
             }
-            let render_cycles = read_cycles().wrapping_sub(render_start);
 
             // Wait for core 1
             while !mc_render::RENDER_DONE.load(core::sync::atomic::Ordering::Acquire) {
@@ -1625,10 +1538,6 @@ async fn ble_midi_pwm_synth(
             #[allow(static_mut_refs)]
             for i in 0..N {
                 output[i] = qadd(output[i], unsafe { mc_render::CORE1_BUF[i] });
-            }
-
-            if render_cycles > peak_cycles {
-                peak_cycles = render_cycles;
             }
 
             // Convert to f32, filter, soft-clip, scale to 10-bit PWM duty
@@ -1657,15 +1566,6 @@ async fn ble_midi_pwm_synth(
                     buf[i] = (duties[i] as u32) << 16;
                 }
                 dma_audio::buffer_filled();
-            }
-
-            // Log CPU utilization once per second
-            block_count += 1;
-            if block_count >= blocks_per_sec {
-                let cpu_pct = ((peak_cycles as u64 * 100) / budget_cycles as u64) as u32;
-                info!("CPU: {}%", cpu_pct);
-                block_count = 0;
-                peak_cycles = 0;
             }
 
             embassy_futures::yield_now().await;
