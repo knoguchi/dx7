@@ -18,17 +18,27 @@ cargo install elf2uf2-rs       # UF2 drag-and-drop
 ```bash
 cd dx7-rp2350
 
-# Benchmark only (no audio)
-cargo build --release
-
-# PWM audio demo (hardcoded note)
-cargo build --release --features pwm
-
 # USB MIDI synth with PWM audio
 cargo build --release --features "usb-midi,pwm"
+
+# BLE MIDI synth with PWM audio (Pico 2 W only)
+cargo build --release --features "ble-midi,pwm"
+
+# USB + BLE MIDI synth with PWM audio (Pico 2 W only)
+cargo build --release --features "usb-midi,ble-midi,pwm"
 ```
 
 ## Flash
+
+### Via uf2-deploy runner (recommended)
+
+Hold BOOTSEL and plug in the Pico, then:
+
+```bash
+cargo run --release --features "usb-midi,ble-midi,pwm"
+```
+
+The `uf2-deploy` script converts the ELF to UF2 and copies it to the RP2350 USB drive automatically.
 
 ### Via debug probe (SWD)
 
@@ -36,45 +46,52 @@ cargo build --release --features "usb-midi,pwm"
 probe-rs run --chip RP2350 target/thumbv8m.main-none-eabihf/release/dx7-rp2350
 ```
 
-### Via UF2 (hold BOOTSEL + plug USB)
+### Via UF2 manual copy
 
 ```bash
 elf2uf2-rs target/thumbv8m.main-none-eabihf/release/dx7-rp2350 dx7-rp2350.uf2
 # Copy dx7-rp2350.uf2 to the RPI-RP2 USB drive
 ```
 
-### Via picotool
-
-```bash
-picotool load target/thumbv8m.main-none-eabihf/release/dx7-rp2350 -t elf -f
-picotool reboot
-```
-
 ## Features
 
-| Feature    | Description                    | Audio | MIDI Input |
-|------------|--------------------------------|-------|------------|
-| `pwm`      | PWM audio on GP15              | Yes   | No (demo)  |
-| `usb-midi` | USB MIDI class device          | —     | Yes        |
-| `i2s`      | PIO I2S for external DAC       | Yes   | No         |
-| `ble-midi` | BLE MIDI via CYW43439          | —     | Yes        |
-| `uart-midi`| Classic 31250 baud MIDI        | —     | Yes        |
+| Feature    | Description                    | Audio | MIDI Input | Board         |
+|------------|--------------------------------|-------|------------|---------------|
+| `pwm`      | PWM audio on GP15              | Yes   | No (demo)  | Any Pico 2    |
+| `usb-midi` | USB MIDI class device          | —     | Yes        | Any Pico 2    |
+| `ble-midi` | BLE MIDI via CYW43439          | —     | Yes        | Pico 2 **W**  |
+| `i2s`      | PIO I2S for external DAC       | Yes   | No         | Any Pico 2    |
+| `uart-midi`| Classic 31250 baud MIDI        | —     | Yes        | Any Pico 2    |
 
 Typical combinations:
-- `--features pwm` — demo playback, no MIDI
-- `--features "usb-midi,pwm"` — live synth, plug into DAW
+- `--features "usb-midi,pwm"` — USB MIDI live synth
+- `--features "ble-midi,pwm"` — wireless BLE MIDI synth
+- `--features "usb-midi,ble-midi,pwm"` — both USB and BLE MIDI simultaneously
 
 ## Architecture
 
-Dual-core rendering with 4-voice polyphony:
-- **Core 0**: embassy async — USB MIDI + renders voices 0-1 + pushes to ring buffer
-- **Core 1**: TIMER0 ALARM3 ISR at 48kHz for PWM output + renders voices 2-3 on demand
+Dual-core rendering with 8-voice polyphony:
+- **Core 0**: embassy async — MIDI input (USB and/or BLE) + renders voices 0-3 + DMA buffer fill
+- **Core 1**: renders voices 4-7 on demand, synchronized via atomic flags
+
+Audio output uses DMA ping-pong double-buffering: two DMA channels alternate between two buffers, writing PWM duty values at 48 kHz with zero CPU involvement during transfer.
+
+### BLE MIDI
+
+On the Pico 2 W, the CYW43 WiFi/BLE chip provides Bluetooth Low Energy. The firmware advertises as "DX7" and accepts BLE MIDI connections. The onboard LED blinks while advertising and goes solid when a device is connected.
+
+### Voice Management
+
+- Polyphonic voice allocation with oldest-voice stealing
+- Same-note deduplication prevents stuck notes on retrigger
+- CC 120 (All Sound Off) and CC 123 (All Notes Off) release all voices
+- SysEx bank reception for loading custom patches
 
 ## Pin Mapping
 
 | Function   | GPIO  | Feature     | Notes                          |
 |------------|-------|-------------|--------------------------------|
-| PWM audio  | GP15  | `pwm`       | RC filter → headphones         |
+| PWM audio  | GP15  | `pwm`       | RC filter → speaker/headphones |
 | I2S BCK    | GP16  | `i2s`       | PCM5102A DAC                   |
 | I2S LRCK   | GP17  | `i2s`       |                                |
 | I2S DOUT   | GP18  | `i2s`       |                                |
@@ -84,7 +101,7 @@ Dual-core rendering with 4-voice polyphony:
 
 ## PWM Audio Wiring
 
-For headphone output from the PWM pin, use a simple RC low-pass filter:
+For speaker/headphone output from the PWM pin, use a simple RC low-pass filter:
 
 ```
 GP15 ──[1kΩ]──┬── audio out
@@ -99,5 +116,5 @@ Cutoff frequency: ~1.6 kHz (adequate for demo; use I2S + DAC for quality audio).
 
 - RP2350: 200 MHz Cortex-M33, 520 KB SRAM
 - Block size: 64 samples @ 48 kHz = 1333 us deadline
-- ~25% CPU per voice per core
-- 4 voices across 2 cores at ~50% utilization each
+- 8 voices across 2 cores (4 per core)
+- DMA audio output with zero CPU overhead during transfer

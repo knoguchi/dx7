@@ -9,7 +9,7 @@ use panic_probe as _;
 
 use embassy_executor::Spawner;
 use embassy_hal_internal::Peri;
-use dx7_core::voice::{Voice, VoiceState};
+use dx7_core::voice::Voice;
 use dx7_core::load_rom1a_voice;
 use dx7_core::tables::N;
 
@@ -365,6 +365,60 @@ mod cyw43_fw {
     pub static FW: &[u8] = include_bytes!("../cyw43-firmware/43439A0.bin");
     pub static BTFW: &[u8] = include_bytes!("../cyw43-firmware/43439A0_btfw.bin");
     pub static CLM: &[u8] = include_bytes!("../cyw43-firmware/43439A0_clm.bin");
+}
+
+// --- Voice dispatch (shared by all entry points) ---
+
+#[cfg(all(any(feature = "usb-midi", feature = "ble-midi"), feature = "pwm"))]
+fn dispatch_midi(
+    msg: dx7_midi::MidiMessage,
+    voices: &mut [dx7_core::voice::Voice],
+    voice_ages: &mut [u32],
+    voice_age: &mut u32,
+    current_patch: &dx7_core::DxVoice,
+) {
+    use dx7_core::voice::VoiceState;
+    match msg {
+        dx7_midi::MidiMessage::NoteOn { note, velocity } => {
+            // Release any existing voice with the same note (prevents duplicates)
+            for v in voices.iter_mut() {
+                if v.note == note && !v.is_finished() {
+                    v.note_off();
+                }
+            }
+            *voice_age += 1;
+            let n = voices.len();
+            let slot = voices.iter().position(|v| v.is_finished())
+                .or_else(|| {
+                    voices.iter().enumerate()
+                        .filter(|(_, v)| v.state == VoiceState::Released)
+                        .min_by_key(|(i, _)| voice_ages[*i])
+                        .map(|(i, _)| i)
+                })
+                .unwrap_or_else(|| {
+                    (0..n).min_by_key(|&i| voice_ages[i]).unwrap()
+                });
+            voices[slot].note_on(current_patch, note, velocity);
+            voice_ages[slot] = *voice_age;
+        }
+        dx7_midi::MidiMessage::NoteOff { note, .. } => {
+            for v in voices.iter_mut() {
+                if v.note == note && !v.is_finished() {
+                    v.note_off();
+                }
+            }
+        }
+        dx7_midi::MidiMessage::ControlChange { controller, .. } => {
+            if controller == 120 || controller == 123 {
+                for v in voices.iter_mut() {
+                    if !v.is_finished() {
+                        v.note_off();
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 // --- Interrupt bindings ---
@@ -730,60 +784,30 @@ async fn usb_midi_pwm_synth(
         loop {
             // Drain MIDI queue
             while let Some(msg) = MIDI_QUEUE.pop() {
-                match msg {
-                    dx7_midi::MidiMessage::NoteOn { note, velocity } => {
-                        *voice_age += 1;
-                        let slot = voices.iter().position(|v| v.is_finished())
-                            .or_else(|| {
-                                // oldest released voice
-                                voices.iter().enumerate()
-                                    .filter(|(_, v)| v.state == VoiceState::Released)
-                                    .min_by_key(|(i, _)| voice_ages[*i])
-                                    .map(|(i, _)| i)
-                            })
-                            .unwrap_or_else(|| {
-                                // steal oldest active
-                                (0..MAX_VOICES).min_by_key(|&i| voice_ages[i]).unwrap()
-                            });
-                        voices[slot].note_on(&current_patch, note, velocity);
-                        voice_ages[slot] = *voice_age;
-                    }
-                    dx7_midi::MidiMessage::NoteOff { note, .. } => {
-                        for v in voices.iter_mut() {
-                            if v.note == note && !v.is_finished() {
-                                v.note_off();
-                                break;
+                if let dx7_midi::MidiMessage::ProgramChange { program } = msg {
+                    if program == 32 {
+                        current_patch = dx7_core::DxVoice::init_voice();
+                    } else if SYSEX_BANK_LOADED.load(core::sync::atomic::Ordering::Acquire)
+                    {
+                        let idx = program as usize;
+                        if idx < 32 {
+                            let start = idx * 128;
+                            let mut voice_data = [0u8; 128];
+                            #[allow(static_mut_refs)]
+                            unsafe {
+                                voice_data.copy_from_slice(
+                                    &SYSEX_BANK[start..start + 128],
+                                );
                             }
+                            current_patch =
+                                dx7_core::DxVoice::from_packed(&voice_data);
+                            info!("Loaded sysex patch {}", idx);
                         }
+                    } else if let Some(p) = load_rom1a_voice(program as usize) {
+                        current_patch = p;
                     }
-                    dx7_midi::MidiMessage::ProgramChange { program } => {
-                        if program == 32 {
-                            // Pure sine test patch (INIT VOICE)
-                            current_patch = dx7_core::DxVoice::init_voice();
-                        } else if SYSEX_BANK_LOADED.load(core::sync::atomic::Ordering::Acquire)
-                        {
-                            // Load from received SysEx bank
-                            let idx = program as usize;
-                            if idx < 32 {
-                                let start = idx * 128;
-                                let mut voice_data = [0u8; 128];
-                                #[allow(static_mut_refs)]
-                                unsafe {
-                                    voice_data.copy_from_slice(
-                                        &SYSEX_BANK[start..start + 128],
-                                    );
-                                }
-                                current_patch =
-                                    dx7_core::DxVoice::from_packed(&voice_data);
-                                info!("Loaded sysex patch {}", idx);
-                            }
-                        } else if let Some(p) = load_rom1a_voice(program as usize) {
-                            current_patch = p;
-                        }
-                    }
-                    dx7_midi::MidiMessage::ControlChange { .. } => {}
-                    _ => {}
                 }
+                dispatch_midi(msg, voices, voice_ages, voice_age, &current_patch);
             }
 
             // Signal core 1 to render voices 2..4
@@ -1063,8 +1087,25 @@ async fn usb_ble_midi_pwm_synth(
         // CYW43 control init
         control.init(cyw43_fw::CLM).await;
         control.set_power_management(cyw43::PowerManagementMode::PowerSave).await;
-        control.gpio_set(0, true).await;
         info!("CYW43 initialized with Bluetooth");
+
+        static BLE_CONNECTED: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+
+        // LED blink task: blink while advertising, solid when connected
+        let led_task = async {
+            loop {
+                if BLE_CONNECTED.load(core::sync::atomic::Ordering::Relaxed) {
+                    control.gpio_set(0, true).await;
+                    embassy_time::Timer::after_millis(200).await;
+                } else {
+                    control.gpio_set(0, true).await;
+                    embassy_time::Timer::after_millis(300).await;
+                    control.gpio_set(0, false).await;
+                    embassy_time::Timer::after_millis(300).await;
+                }
+            }
+        };
 
         // trouble-host BLE stack
         let controller: ExternalController<_, 1> = ExternalController::new(bt_device);
@@ -1101,8 +1142,10 @@ async fn usb_ble_midi_pwm_synth(
                 };
 
                 info!("BLE: advertising as 'DX7'...");
+                BLE_CONNECTED.store(false, core::sync::atomic::Ordering::Relaxed);
                 let advertiser = peripheral.advertise(&Default::default(), adv_data).await.unwrap();
                 let conn = advertiser.accept().await.unwrap();
+                BLE_CONNECTED.store(true, core::sync::atomic::Ordering::Relaxed);
                 info!("BLE: connected!");
 
                 let gatt_conn = conn.with_attribute_server(&server).unwrap();
@@ -1110,6 +1153,7 @@ async fn usb_ble_midi_pwm_synth(
                 loop {
                     match gatt_conn.next().await {
                         GattConnectionEvent::Disconnected { .. } => {
+                            BLE_CONNECTED.store(false, core::sync::atomic::Ordering::Relaxed);
                             info!("BLE: disconnected");
                             break;
                         }
@@ -1164,55 +1208,29 @@ async fn usb_ble_midi_pwm_synth(
             loop {
                 // Drain MIDI queue (fed by both USB and BLE)
                 while let Some(msg) = MIDI_QUEUE.pop() {
-                    match msg {
-                        dx7_midi::MidiMessage::NoteOn { note, velocity } => {
-                            *voice_age += 1;
-                            let slot = voices.iter().position(|v| v.is_finished())
-                                .or_else(|| {
-                                    voices.iter().enumerate()
-                                        .filter(|(_, v)| v.state == VoiceState::Released)
-                                        .min_by_key(|(i, _)| voice_ages[*i])
-                                        .map(|(i, _)| i)
-                                })
-                                .unwrap_or_else(|| {
-                                    (0..MAX_VOICES).min_by_key(|&i| voice_ages[i]).unwrap()
-                                });
-                            voices[slot].note_on(&current_patch, note, velocity);
-                            voice_ages[slot] = *voice_age;
-                        }
-                        dx7_midi::MidiMessage::NoteOff { note, .. } => {
-                            for v in voices.iter_mut() {
-                                if v.note == note && !v.is_finished() {
-                                    v.note_off();
-                                    break;
+                    if let dx7_midi::MidiMessage::ProgramChange { program } = msg {
+                        if program == 32 {
+                            current_patch = dx7_core::DxVoice::init_voice();
+                        } else if SYSEX_BANK_LOADED.load(core::sync::atomic::Ordering::Acquire) {
+                            let idx = program as usize;
+                            if idx < 32 {
+                                let start = idx * 128;
+                                let mut voice_data = [0u8; 128];
+                                #[allow(static_mut_refs)]
+                                unsafe {
+                                    voice_data.copy_from_slice(
+                                        &SYSEX_BANK[start..start + 128],
+                                    );
                                 }
+                                current_patch =
+                                    dx7_core::DxVoice::from_packed(&voice_data);
+                                info!("Loaded sysex patch {}", idx);
                             }
+                        } else if let Some(p) = load_rom1a_voice(program as usize) {
+                            current_patch = p;
                         }
-                        dx7_midi::MidiMessage::ProgramChange { program } => {
-                            if program == 32 {
-                                current_patch = dx7_core::DxVoice::init_voice();
-                            } else if SYSEX_BANK_LOADED.load(core::sync::atomic::Ordering::Acquire) {
-                                let idx = program as usize;
-                                if idx < 32 {
-                                    let start = idx * 128;
-                                    let mut voice_data = [0u8; 128];
-                                    #[allow(static_mut_refs)]
-                                    unsafe {
-                                        voice_data.copy_from_slice(
-                                            &SYSEX_BANK[start..start + 128],
-                                        );
-                                    }
-                                    current_patch =
-                                        dx7_core::DxVoice::from_packed(&voice_data);
-                                    info!("Loaded sysex patch {}", idx);
-                                }
-                            } else if let Some(p) = load_rom1a_voice(program as usize) {
-                                current_patch = p;
-                            }
-                        }
-                        dx7_midi::MidiMessage::ControlChange { .. } => {}
-                        _ => {}
                     }
+                    dispatch_midi(msg, voices, voice_ages, voice_age, &current_patch);
                 }
 
                 // Signal core 1
@@ -1270,8 +1288,9 @@ async fn usb_ble_midi_pwm_synth(
             }
         };
 
-        // Run USB driver, USB MIDI reader, BLE host, BLE task, and audio concurrently
-        embassy_futures::join::join3(
+        // Run LED, BLE host, BLE task, and audio concurrently
+        embassy_futures::join::join4(
+            led_task,
             ble_host_task,
             ble_task,
             audio_render,
@@ -1373,9 +1392,25 @@ async fn ble_midi_pwm_synth(
         // CYW43 control init (sends ioctls to the runner — runner must be running)
         control.init(cyw43_fw::CLM).await;
         control.set_power_management(cyw43::PowerManagementMode::PowerSave).await;
-        // LED on = CYW43 init succeeded (Pico 2 W LED is GPIO0 on CYW43)
-        control.gpio_set(0, true).await;
         info!("CYW43 initialized with Bluetooth");
+
+        static BLE_CONNECTED: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+
+        // LED blink task: blink while advertising, solid when connected
+        let led_task = async {
+            loop {
+                if BLE_CONNECTED.load(core::sync::atomic::Ordering::Relaxed) {
+                    control.gpio_set(0, true).await;
+                    embassy_time::Timer::after_millis(200).await;
+                } else {
+                    control.gpio_set(0, true).await;
+                    embassy_time::Timer::after_millis(300).await;
+                    control.gpio_set(0, false).await;
+                    embassy_time::Timer::after_millis(300).await;
+                }
+            }
+        };
 
         // trouble-host BLE stack
         let controller: ExternalController<_, 1> = ExternalController::new(bt_device);
@@ -1414,8 +1449,10 @@ async fn ble_midi_pwm_synth(
                 };
 
                 info!("BLE: advertising as 'DX7'...");
+                BLE_CONNECTED.store(false, core::sync::atomic::Ordering::Relaxed);
                 let advertiser = peripheral.advertise(&Default::default(), adv_data).await.unwrap();
                 let conn = advertiser.accept().await.unwrap();
+                BLE_CONNECTED.store(true, core::sync::atomic::Ordering::Relaxed);
                 info!("BLE: connected!");
 
                 let gatt_conn = conn.with_attribute_server(&server).unwrap();
@@ -1423,6 +1460,7 @@ async fn ble_midi_pwm_synth(
                 loop {
                     match gatt_conn.next().await {
                         GattConnectionEvent::Disconnected { .. } => {
+                            BLE_CONNECTED.store(false, core::sync::atomic::Ordering::Relaxed);
                             info!("BLE: disconnected");
                             break;
                         }
@@ -1477,40 +1515,14 @@ async fn ble_midi_pwm_synth(
         loop {
             // Drain MIDI queue
             while let Some(msg) = MIDI_QUEUE.pop() {
-                match msg {
-                    dx7_midi::MidiMessage::NoteOn { note, velocity } => {
-                        *voice_age += 1;
-                        let slot = voices.iter().position(|v| v.is_finished())
-                            .or_else(|| {
-                                voices.iter().enumerate()
-                                    .filter(|(_, v)| v.state == VoiceState::Released)
-                                    .min_by_key(|(i, _)| voice_ages[*i])
-                                    .map(|(i, _)| i)
-                            })
-                            .unwrap_or_else(|| {
-                                (0..MAX_VOICES).min_by_key(|&i| voice_ages[i]).unwrap()
-                            });
-                        voices[slot].note_on(&current_patch, note, velocity);
-                        voice_ages[slot] = *voice_age;
+                if let dx7_midi::MidiMessage::ProgramChange { program } = msg {
+                    if program == 32 {
+                        current_patch = dx7_core::DxVoice::init_voice();
+                    } else if let Some(p) = load_rom1a_voice(program as usize) {
+                        current_patch = p;
                     }
-                    dx7_midi::MidiMessage::NoteOff { note, .. } => {
-                        for v in voices.iter_mut() {
-                            if v.note == note && !v.is_finished() {
-                                v.note_off();
-                                break;
-                            }
-                        }
-                    }
-                    dx7_midi::MidiMessage::ProgramChange { program } => {
-                        if program == 32 {
-                            current_patch = dx7_core::DxVoice::init_voice();
-                        } else if let Some(p) = load_rom1a_voice(program as usize) {
-                            current_patch = p;
-                        }
-                    }
-                    dx7_midi::MidiMessage::ControlChange { .. } => {}
-                    _ => {}
                 }
+                dispatch_midi(msg, voices, voice_ages, voice_age, &current_patch);
             }
 
             // Signal core 1 to render voices MAX_VOICES/2..MAX_VOICES
@@ -1572,8 +1584,8 @@ async fn ble_midi_pwm_synth(
         }
     };
 
-        // Run BLE host + BLE task + audio render concurrently
-        embassy_futures::join::join3(ble_host_task, ble_task, audio_render).await
+        // Run LED, BLE host, BLE task, and audio render concurrently
+        embassy_futures::join::join4(led_task, ble_host_task, ble_task, audio_render).await
     };
 
     // Run CYW43 driver alongside everything else.

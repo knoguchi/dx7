@@ -18,7 +18,7 @@ pub enum MidiMessage {
 /// Simple lock-free single-producer single-consumer ring buffer for MIDI messages.
 /// BLE task writes, audio task reads.
 pub struct MidiQueue {
-    buf: [MidiMessage; 32],
+    buf: [MidiMessage; 256],
     head: core::sync::atomic::AtomicUsize,
     tail: core::sync::atomic::AtomicUsize,
 }
@@ -27,7 +27,7 @@ impl MidiQueue {
     pub const fn new() -> Self {
         const EMPTY: MidiMessage = MidiMessage::NoteOff { note: 0, velocity: 0 };
         Self {
-            buf: [EMPTY; 32],
+            buf: [EMPTY; 256],
             head: core::sync::atomic::AtomicUsize::new(0),
             tail: core::sync::atomic::AtomicUsize::new(0),
         }
@@ -98,15 +98,15 @@ mod tests {
     #[test]
     fn full_queue_drops_message() {
         let q = MidiQueue::new();
-        // Fill all 31 slots (capacity = buf.len() - 1)
-        for i in 0..31 {
-            q.push(MidiMessage::NoteOn { note: i as u8, velocity: 100 });
+        // Fill all 255 slots (capacity = buf.len() - 1)
+        for i in 0..255 {
+            q.push(MidiMessage::NoteOn { note: (i % 128) as u8, velocity: 100 });
         }
         // This should be silently dropped
         q.push(MidiMessage::NoteOn { note: 99, velocity: 127 });
-        // Drain and verify the 32nd message was dropped
-        for i in 0..31 {
-            assert_eq!(q.pop(), Some(MidiMessage::NoteOn { note: i as u8, velocity: 100 }));
+        // Drain and verify the 256th message was dropped
+        for i in 0..255 {
+            assert_eq!(q.pop(), Some(MidiMessage::NoteOn { note: (i % 128) as u8, velocity: 100 }));
         }
         assert_eq!(q.pop(), None);
     }
