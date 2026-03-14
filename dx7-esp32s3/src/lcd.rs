@@ -1,7 +1,9 @@
-/// GC9A01 240x240 round LCD display driver (SPI, BasicMode — no framebuffer).
+/// GC9A01 240x240 round LCD display driver (SPI, BasicMode — no framebuffer)
+/// + CST816D touch panel (I2C).
 
 use esp_hal::gpio::{Level, Output, OutputConfig};
 use esp_hal::spi::master::{Spi, Config as SpiConfig};
+use esp_hal::i2c::master::{I2c, Config as I2cConfig};
 use esp_hal::time::Rate;
 use esp_hal::Blocking;
 
@@ -23,9 +25,13 @@ type Display = Gc9a01<
 >;
 
 static mut DISPLAY: Option<Display> = None;
+static mut TOUCH_I2C: Option<I2c<'static, Blocking>> = None;
 
-/// Initialize the GC9A01 display. Call once at startup.
+const CST816_ADDR: u8 = 0x15;
+
+/// Initialize the GC9A01 display and CST816D touch panel.
 pub fn init() {
+    // --- Display (SPI) ---
     let spi = Spi::new(
         unsafe { esp_hal::peripherals::SPI2::steal() },
         SpiConfig::default().with_frequency(Rate::from_mhz(40)),
@@ -60,7 +66,6 @@ pub fn init() {
         DisplayRotation::Rotate0,
     );
 
-    // Hardware reset
     rst.set_low();
     busy_delay_ms(10);
     rst.set_high();
@@ -73,6 +78,62 @@ pub fn init() {
 
     core::mem::forget(rst);
     unsafe { DISPLAY = Some(display); }
+
+    // --- Touch panel (I2C on I2C1, SDA=11, SCL=7) ---
+    let mut tp_rst = Output::new(
+        unsafe { esp_hal::peripherals::GPIO6::steal() },
+        Level::Low, OutputConfig::default(),
+    );
+    busy_delay_ms(10);
+    tp_rst.set_high();
+    busy_delay_ms(50);
+    core::mem::forget(tp_rst);
+
+    let i2c = I2c::new(
+        unsafe { esp_hal::peripherals::I2C1::steal() },
+        I2cConfig::default().with_frequency(Rate::from_khz(400)),
+    ).unwrap()
+    .with_sda(unsafe { esp_hal::peripherals::GPIO11::steal() })
+    .with_scl(unsafe { esp_hal::peripherals::GPIO7::steal() });
+
+    unsafe { TOUCH_I2C = Some(i2c); }
+}
+
+/// Swipe direction from touch panel.
+#[derive(PartialEq)]
+pub enum Swipe {
+    Up,
+    Down,
+    Left,
+}
+
+static mut LAST_GESTURE: u8 = 0;
+
+/// Poll touch panel. Returns Some(Swipe) on new swipe gesture.
+pub fn poll_touch() -> Option<Swipe> {
+    let i2c = unsafe { TOUCH_I2C.as_mut()? };
+
+    let mut buf = [0u8; 6];
+    if i2c.write_read(CST816_ADDR, &[0x01], &mut buf).is_err() {
+        return None;
+    }
+
+    let gesture = buf[0];
+    let prev = unsafe { LAST_GESTURE };
+    unsafe { LAST_GESTURE = gesture; }
+
+    // Only trigger on new gesture (not repeated reads)
+    if gesture == prev || gesture == 0 {
+        return None;
+    }
+
+    match gesture {
+        0x01 => Some(Swipe::Down),
+        0x02 => Some(Swipe::Up),
+        0x03 => Some(Swipe::Left),
+        0x04 => Some(Swipe::Left), // try both in case
+        _ => None,
+    }
 }
 
 /// Draw patch name centered on display.
@@ -82,7 +143,6 @@ pub fn draw_patch(program: u8, name: &str) {
     use embedded_graphics::prelude::DrawTarget as _;
     DrawTarget::clear(display, Rgb565::BLACK).unwrap();
 
-    // Format "N: NAME"
     let mut buf = [0u8; 16];
     let len = format_patch_line(program + 1, name.trim(), &mut buf);
     let line = core::str::from_utf8(&buf[..len]).unwrap();
@@ -98,36 +158,18 @@ pub fn draw_patch(program: u8, name: &str) {
         .unwrap();
 }
 
-/// Format "N: NAME" into buf, return length.
+/// Format "N:NAME" into buf, return length.
 fn format_patch_line(num: u8, name: &str, buf: &mut [u8; 16]) -> usize {
     let mut pos = 0;
-    // Write number
     if num >= 100 { buf[pos] = b'0' + num / 100; pos += 1; }
     if num >= 10 { buf[pos] = b'0' + (num / 10) % 10; pos += 1; }
     buf[pos] = b'0' + num % 10; pos += 1;
     buf[pos] = b':'; pos += 1;
-    // Write name (up to remaining space)
     for &b in name.as_bytes() {
         if pos >= buf.len() { break; }
         buf[pos] = b; pos += 1;
     }
     pos
-}
-
-fn format_u8(n: u8, buf: &mut [u8; 4]) -> &str {
-    let mut i = buf.len();
-    let mut val = n;
-    if val == 0 {
-        i -= 1;
-        buf[i] = b'0';
-    } else {
-        while val > 0 {
-            i -= 1;
-            buf[i] = b'0' + (val % 10);
-            val /= 10;
-        }
-    }
-    core::str::from_utf8(&buf[i..]).unwrap()
 }
 
 fn busy_delay_ms(ms: u32) {

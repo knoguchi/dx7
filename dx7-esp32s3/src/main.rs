@@ -461,7 +461,53 @@ async fn ble_midi_synth(bluetooth: esp_hal::peripherals::BT<'static>) -> ! {
 
     let audio_task = async {
         let mut output = [0i32; N];
+        #[cfg(feature = "lcd")]
+        let mut current_program: u8 = 0;
+        #[cfg(feature = "lcd")]
+        let mut chord_off_countdown: u32 = 0;
         loop {
+            // Poll touch panel for patch switching
+            #[cfg(feature = "lcd")]
+            if let Some(swipe) = lcd::poll_touch() {
+                match swipe {
+                    lcd::Swipe::Up | lcd::Swipe::Down => {
+                        let new_prog = match swipe {
+                            lcd::Swipe::Up => if current_program < 31 { current_program + 1 } else { 0 },
+                            _ => if current_program > 0 { current_program - 1 } else { 31 },
+                        };
+                        if let Some(p) = load_rom1a_voice(new_prog as usize) {
+                            lcd::draw_patch(new_prog, p.name_str());
+                            channels[0].patch = p;
+                            current_program = new_prog;
+                        }
+                    }
+                    lcd::Swipe::Left => {
+                        // Play C major chord: C4 E4 G4, auto note-off after ~1s
+                        for &note in &[60u8, 64, 67] {
+                            dispatch_midi(
+                                dx7_midi::MidiMessage::NoteOn { channel: 0, note, velocity: 100 },
+                                voices, voice_ages, voice_age, &mut channels,
+                            );
+                        }
+                        chord_off_countdown = (SAMPLE_RATE as u32) / (N as u32); // ~1 second in blocks
+                    }
+                }
+            }
+
+            // Auto note-off for touch chord
+            #[cfg(feature = "lcd")]
+            if chord_off_countdown > 0 {
+                chord_off_countdown -= 1;
+                if chord_off_countdown == 0 {
+                    for &note in &[60u8, 64, 67] {
+                        dispatch_midi(
+                            dx7_midi::MidiMessage::NoteOff { channel: 0, note, velocity: 0 },
+                            voices, voice_ages, voice_age, &mut channels,
+                        );
+                    }
+                }
+            }
+
             // Drain MIDI queue
             while let Some(msg) = MIDI_QUEUE.pop() {
                 dispatch_midi(msg, voices, voice_ages, voice_age, &mut channels);
