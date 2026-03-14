@@ -159,8 +159,8 @@ pub fn init(i2c: &mut I2c<'_, Blocking>, mclk_hz: u32, sample_rate: u32) {
     wreg(i2c, REG37_DAC, 0x08);
     wreg(i2c, REG45_GP, 0x00);
 
-    // Set DAC volume to 0dB
-    wreg(i2c, REG32_DAC_VOL, 0xBF);
+    // Set DAC volume to -12dB (0xBF = 0dB, each step = 0.5dB)
+    wreg(i2c, REG32_DAC_VOL, 0xBF - 24);
 }
 
 /// Set DAC volume. 0x00 = -95.5dB, 0xBF = 0dB, 0xFF = +32dB.
