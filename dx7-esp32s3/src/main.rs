@@ -15,6 +15,8 @@ use dx7_core::tables::N;
 
 #[cfg(feature = "es8311")]
 mod es8311;
+#[cfg(feature = "lcd")]
+mod lcd;
 
 const SAMPLE_RATE: u32 = 48000;
 const CPU_CLOCK: esp_hal::clock::CpuClock = esp_hal::clock::CpuClock::_160MHz;
@@ -268,8 +270,9 @@ fn dispatch_midi(
         }
         dx7_midi::MidiMessage::ProgramChange { program, .. } => {
             if let Some(p) = load_rom1a_voice(program as usize) {
+                #[cfg(feature = "lcd")]
+                lcd::draw_patch(program, p.name_str());
                 channels[0].patch = p;
-                println!("Patch {}", program);
             }
         }
         _ => {}
@@ -295,6 +298,14 @@ async fn main(_spawner: embassy_executor::Spawner) {
     // Init scheduler (BLE radio needs it)
     let timg0 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0);
+
+    // Initialize LCD display
+    #[cfg(feature = "lcd")]
+    {
+        lcd::init();
+        lcd::draw_patch(0, load_rom1a_voice(0).unwrap().name_str());
+        println!("LCD initialized");
+    }
 
     // Initialize shared voice pool
     #[allow(static_mut_refs)]

@@ -19,6 +19,12 @@ embassy-futures = { version = "0.1", optional = true }
 embassy-sync = { version = "0.7", optional = true }
 embassy-usb = { version = "0.5", optional = true }
 static_cell = { version = "2.1", optional = true }
+gc9a01-rs = { version = "0.4", default-features = false, features = ["graphics"], optional = true }
+display-interface-spi = { version = "0.5", optional = true }
+embedded-graphics = { version = "0.8", optional = true }
+cst816s = { version = "1.0", optional = true }
+embedded-hal = { version = "1.0", optional = true }
+embedded-hal-bus = { version = "0.2", optional = true }
 esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32s3"] }
 
 [features]
@@ -27,6 +33,7 @@ pwm = []
 es8311 = []
 ble-midi = ["dep:esp-radio", "dep:esp-rtos", "dep:trouble-host", "dep:embassy-executor", "dep:embassy-futures", "dep:embassy-sync", "dep:static_cell"]
 usb-midi = ["dep:esp-rtos", "dep:embassy-executor", "dep:embassy-futures", "dep:embassy-sync", "dep:embassy-usb", "dep:static_cell"]
+lcd = ["dep:gc9a01-rs", "dep:display-interface-spi", "dep:embedded-graphics", "dep:cst816s", "dep:embedded-hal", "dep:embedded-hal-bus"]
 
 [patch.crates-io]
 esp-rom-sys = { path = "patches/esp-rom-sys" }
