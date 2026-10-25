@@ -27,11 +27,18 @@ struct ChannelState {
     pitch_bend: i32,
     mod_wheel: i32,
     sustain: bool,
+    /// Mix gain for voices started on this channel, Q8 fixed point
+    /// (256 = unity). Set from `dx7_midi::gm::program_gain` on a GM
+    /// ProgramChange so quiet DX7 patches (bass) match the rest of the set.
+    gain_q8: u32,
 }
 
 impl ChannelState {
+    /// Unity gain.
+    const UNITY_GAIN_Q8: u32 = 256;
+
     fn new(patch: dx7_core::DxVoice) -> Self {
-        Self { patch, pitch_bend: 0, mod_wheel: 0, sustain: false }
+        Self { patch, pitch_bend: 0, mod_wheel: 0, sustain: false, gain_q8: Self::UNITY_GAIN_Q8 }
     }
 }
 
@@ -338,42 +345,48 @@ mod dma_audio {
     }
 }
 
+// --- Lock-free shared cell ---
+
+/// Interior-mutable static shared between tasks or cores without a lock.
+///
+/// The type only supplies the `UnsafeCell` that makes writes through a shared
+/// reference legal; exclusivity must come from a protocol documented at the
+/// declaration of each static that uses it (e.g. the RENDER_START /
+/// RENDER_DONE handshake on `mc_render::VoicePool`).
+#[cfg(all(any(feature = "usb-midi", feature = "ble-midi"), feature = "pwm"))]
+#[repr(transparent)]
+pub struct RacyCell<T>(core::cell::UnsafeCell<T>);
+
+// SAFETY: access is serialised by the protocol documented at each use site.
+// T: Send so handing the value between cores (what those protocols do) is
+// permitted.
+#[cfg(all(any(feature = "usb-midi", feature = "ble-midi"), feature = "pwm"))]
+unsafe impl<T: Send> Sync for RacyCell<T> {}
+
+#[cfg(all(any(feature = "usb-midi", feature = "ble-midi"), feature = "pwm"))]
+impl<T> RacyCell<T> {
+    pub const fn new(v: T) -> Self {
+        Self(core::cell::UnsafeCell::new(v))
+    }
+
+    /// Raw pointer to the contents.
+    ///
+    /// # Safety
+    /// Dereferencing is only sound while no other reference derived from this
+    /// cell is live on either core.
+    pub const fn get(&self) -> *mut T {
+        self.0.get()
+    }
+}
+
 // --- Multi-core voice rendering (DMA handles PWM output) ---
 
 #[cfg(all(any(feature = "usb-midi", feature = "ble-midi"), feature = "pwm"))]
 mod mc_render {
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use dx7_core::voice::Voice;
     use dx7_core::tables::N;
-    use super::MAX_VOICES;
-
-    /// Interior-mutable static shared between the two cores without a lock.
-    ///
-    /// The type only supplies the `UnsafeCell` that makes writes through a
-    /// shared reference legal; exclusivity comes from the RENDER_START /
-    /// RENDER_DONE handshake documented on [`VoicePool`].
-    #[repr(transparent)]
-    pub struct RacyCell<T>(core::cell::UnsafeCell<T>);
-
-    // SAFETY: access is serialised by the RENDER_START/RENDER_DONE protocol;
-    // see VoicePool. T: Send so moving the value's ownership between cores
-    // (which is what the handshake does) is permitted.
-    unsafe impl<T: Send> Sync for RacyCell<T> {}
-
-    impl<T> RacyCell<T> {
-        pub const fn new(v: T) -> Self {
-            Self(core::cell::UnsafeCell::new(v))
-        }
-
-        /// Raw pointer to the contents.
-        ///
-        /// # Safety
-        /// Dereferencing is only sound while no other reference derived from
-        /// this cell is live on either core.
-        pub const fn get(&self) -> *mut T {
-            self.0.get()
-        }
-    }
+    use super::{RacyCell, MAX_VOICES};
 
     /// Shared voice pool, one `UnsafeCell` per slot so the two cores never
     /// hold overlapping `&mut` into one array.
@@ -445,6 +458,32 @@ mod mc_render {
 
     pub static VOICES: VoicePool = VoicePool::new();
 
+    /// Per-slot mix gain, Q8 (256 = unity). Written by core 0 in the dispatch
+    /// phase when a slot is (re)started, read by whichever core renders the
+    /// slot. The RENDER_START Release / Acquire pair orders the store before
+    /// core 1's loads; Relaxed is enough on the atomics themselves.
+    pub static VOICE_GAIN_Q8: [AtomicU32; MAX_VOICES] =
+        [const { AtomicU32::new(256) }; MAX_VOICES];
+
+    /// Accumulate one rendered voice block into `out` with saturating adds,
+    /// scaled by `gain_q8` (Q8 fixed point). Unity gain takes the plain path
+    /// so DX7 mode renders exactly as before.
+    #[inline(always)]
+    pub fn mix_voice(out: &mut [i32; N], buf: &[i32; N], gain_q8: u32) {
+        if gain_q8 == 256 {
+            for i in 0..N {
+                out[i] = super::qadd(out[i], buf[i]);
+            }
+        } else {
+            let g = gain_q8 as i64;
+            for i in 0..N {
+                let scaled = ((buf[i] as i64 * g) >> 8)
+                    .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                out[i] = super::qadd(out[i], scaled);
+            }
+        }
+    }
+
     /// Core 1 render output. Written by core 1 during the render phase, read
     /// by core 0 only after it has observed RENDER_DONE — same protocol as
     /// [`VoicePool`].
@@ -482,14 +521,135 @@ mod mc_render {
                     if !v.is_finished() {
                         let mut buf = [0i32; N];
                         v.render(&mut buf);
-                        for j in 0..N {
-                            out[j] = super::qadd(out[j], buf[j]);
-                        }
+                        mix_voice(out, &buf, VOICE_GAIN_Q8[idx].load(Ordering::Relaxed));
                     }
                 }
             }
 
             RENDER_DONE.store(true, Ordering::Release);
+        }
+    }
+}
+
+// --- SysEx reception (shared by the USB and BLE transports) ---
+
+#[cfg(all(any(feature = "usb-midi", feature = "ble-midi"), feature = "pwm"))]
+mod sysex {
+    use super::{RacyCell, MIDI_CHANNEL, SYNTH_MODE};
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use defmt::info;
+
+    /// Largest accepted message: a DX7 32-voice bulk dump is 4104 bytes.
+    const MAX_LEN: usize = 4200;
+
+    /// Byte-at-a-time SysEx accumulator. Use one instance per transport so a
+    /// message arriving on USB cannot be interleaved with one arriving on BLE.
+    pub struct SysexRx {
+        buf: [u8; MAX_LEN],
+        pos: usize,
+        active: bool,
+    }
+
+    impl SysexRx {
+        pub const fn new() -> Self {
+            Self { buf: [0; MAX_LEN], pos: 0, active: false }
+        }
+
+        /// Feed one byte of a SysEx stream (`F0` through `F7` inclusive).
+        /// When the terminating `F7` arrives the complete message is acted on.
+        /// Oversized messages are truncated and then fail the length checks.
+        pub fn feed(&mut self, b: u8, queue: &dx7_midi::MidiQueue) {
+            if b == 0xF0 {
+                self.pos = 0;
+                self.active = true;
+            }
+            if !self.active {
+                return;
+            }
+            if self.pos < MAX_LEN {
+                self.buf[self.pos] = b;
+                self.pos += 1;
+            }
+            if b == 0xF7 {
+                self.active = false;
+                process(&self.buf[..self.pos], queue);
+            }
+        }
+    }
+
+    /// 32-voice bank (32 packed voices x 128 bytes) from the last bulk dump.
+    ///
+    /// Written by whichever input task receives a dump, read by the audio
+    /// task on ProgramChange. All of them are cooperative async tasks on core
+    /// 0 and none holds a reference across an `.await`, so a write can never
+    /// overlap a read. BANK_LOADED publishes the first load.
+    static BANK: RacyCell<[u8; 4096]> = RacyCell::new([0u8; 4096]);
+    static BANK_LOADED: AtomicBool = AtomicBool::new(false);
+
+    /// The loaded bank, if any. Do not hold the result across an `.await`.
+    pub fn bank() -> Option<&'static [u8; 4096]> {
+        if BANK_LOADED.load(Ordering::Acquire) {
+            // SAFETY: see BANK.
+            Some(unsafe { &*BANK.get() })
+        } else {
+            None
+        }
+    }
+
+    /// Act on a complete SysEx message (`msg[0] == 0xF0`, last byte `0xF7`).
+    fn process(msg: &[u8], queue: &dx7_midi::MidiQueue) {
+        let len = msg.len();
+        if len == 5 && msg[0] == 0xF0 && msg[1] == 0x7D && msg[4] == 0xF7 {
+            // Custom (educational manufacturer ID 7D) configuration commands
+            match msg[2] {
+                0x01 => {
+                    // Mode switch: 0=DX7, 1=GM
+                    let mode = msg[3];
+                    SYNTH_MODE.store(mode, Ordering::Release);
+                    info!("Mode: {}", if mode == 0 { "DX7" } else { "GM" });
+                    // Release all voices on mode switch so nothing sticks
+                    for ch in 0..16u8 {
+                        queue.push(dx7_midi::MidiMessage::ControlChange {
+                            channel: ch, controller: 123, value: 0,
+                        });
+                    }
+                }
+                0x02 => {
+                    // Set MIDI receive channel (DX7 mode)
+                    let ch = msg[3];
+                    MIDI_CHANNEL.store(ch, Ordering::Release);
+                    if ch == 0x7F {
+                        info!("MIDI channel: OMNI");
+                    } else {
+                        info!("MIDI channel: {}", ch + 1);
+                    }
+                }
+                other => {
+                    info!("SysEx: unknown cmd 0x{:02X}", other);
+                }
+            }
+        } else if len == 4104
+            && msg[0] == 0xF0
+            && msg[1] == 0x43
+            && (msg[2] & 0xF0) == 0x00
+            && msg[3] == 0x09
+            && msg[4] == 0x20
+            && msg[5] == 0x00
+            && msg[4103] == 0xF7
+        {
+            // DX7 32-voice bulk dump — verify checksum
+            let sum: u8 = msg[6..4102].iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+            let expected = (!sum).wrapping_add(1) & 0x7F;
+            if expected == msg[4102] {
+                // SAFETY: see BANK.
+                unsafe { (*BANK.get()).copy_from_slice(&msg[6..4102]); }
+                BANK_LOADED.store(true, Ordering::Release);
+                info!("SysEx: loaded 32-voice bank");
+            } else {
+                info!("SysEx: checksum mismatch ({} vs {})", expected, msg[4102]);
+            }
+        } else if len > 0 {
+            info!("SysEx: ignored ({} bytes)", len);
         }
     }
 }
@@ -548,25 +708,31 @@ fn dispatch_midi(
 
     match msg {
         dx7_midi::MidiMessage::NoteOn { channel, note, velocity } => {
-            // Resolve the patch before touching any voice: a GM drum note with
-            // no DRUM_MAP entry must return without killing or stealing anything.
-            let patch = if synth_mode == 0 {
+            // Resolve the patch (and its mix gain) before touching any voice: a
+            // GM drum note with no DRUM_MAP entry must return without killing or
+            // stealing anything.
+            let (patch, gain_q8) = if synth_mode == 0 {
                 // DX7 mode: always use channels[0].patch, no drum mapping
-                channels[0].patch.clone()
+                (channels[0].patch.clone(), ChannelState::UNITY_GAIN_Q8)
             } else if channel == 9 {
                 // GM mode: channel 9 = drums
                 match dx7_midi::drum::drum_voice(note) {
-                    Some(dp) => dp,
+                    Some(dp) => (dp, ChannelState::UNITY_GAIN_Q8),
                     None => return,
                 }
             } else {
-                channels[channel as usize].patch.clone()
+                let ch = &channels[channel as usize];
+                (ch.patch.clone(), ch.gain_q8)
             };
+            // Same-note retrigger: hard-kill the old instance. Clear sustain_held
+            // too, otherwise a later CC64-off would call note_off() on this now
+            // Inactive (and possibly reallocated) slot.
             if synth_mode == 0 {
                 // DX7 mode: match by note only (ignore channel for dedup)
                 for v in voices.iter_mut() {
                     if v.note == note && !v.is_finished() {
                         v.state = VoiceState::Inactive;
+                        v.sustain_held = false;
                     }
                 }
             } else {
@@ -574,6 +740,7 @@ fn dispatch_midi(
                 for v in voices.iter_mut() {
                     if v.note == note && v.channel == channel && !v.is_finished() {
                         v.state = VoiceState::Inactive;
+                        v.sustain_held = false;
                     }
                 }
             }
@@ -600,6 +767,7 @@ fn dispatch_midi(
             voices[slot].note_on(&patch, note, velocity);
             voices[slot].channel = channel;
             voices[slot].sustain_held = false;
+            mc_render::VOICE_GAIN_Q8[slot].store(gain_q8, Ordering::Relaxed);
             if synth_mode == 0 {
                 // DX7 mode: use global (ch 0) bend/mod
                 voices[slot].pitch_bend = channels[0].pitch_bend;
@@ -705,19 +873,25 @@ fn dispatch_midi(
                         }
                     }
                 }
-                120 | 123 => {
-                    if synth_mode == 0 {
-                        // DX7 mode: kill ALL voices
-                        for v in voices.iter_mut() {
-                            if !v.is_finished() {
-                                v.note_off();
-                            }
+                120 => {
+                    // All Sound Off: immediate silence, no release stage.
+                    // Setting Inactive makes render() skip the voice from the
+                    // next block on; sustain_held is cleared so CC64-off cannot
+                    // resurrect the slot.
+                    for v in voices.iter_mut() {
+                        if (synth_mode == 0 || v.channel == channel) && !v.is_finished() {
+                            v.state = VoiceState::Inactive;
+                            v.sustain_held = false;
                         }
-                    } else {
-                        for v in voices.iter_mut() {
-                            if v.channel == channel && !v.is_finished() {
-                                v.note_off();
-                            }
+                    }
+                }
+                123 => {
+                    // All Notes Off: release (envelope tail plays out).
+                    // DX7 mode applies to all voices, GM mode per channel.
+                    for v in voices.iter_mut() {
+                        if (synth_mode == 0 || v.channel == channel) && !v.is_finished() {
+                            v.sustain_held = false;
+                            v.note_off();
                         }
                     }
                 }
@@ -738,6 +912,7 @@ fn dispatch_midi(
                 } else if let Some(p) = dx7_core::load_rom1a_voice(program as usize) {
                     channels[0].patch = p;
                 }
+                channels[0].gain_q8 = ChannelState::UNITY_GAIN_Q8;
                 // Out-of-range program: ignored. No logging here — this runs
                 // inside the audio render task (see module note on defmt).
             } else {
@@ -750,9 +925,13 @@ fn dispatch_midi(
                         let mut voice_data = [0u8; 128];
                         voice_data.copy_from_slice(&bank[start..start + 128]);
                         channels[ch].patch = dx7_core::DxVoice::from_packed(&voice_data);
+                        channels[ch].gain_q8 = ChannelState::UNITY_GAIN_Q8;
                     }
                 } else {
                     channels[ch].patch = dx7_midi::gm::gm_voice(program);
+                    // GM level normalisation (bass 4x, strings/reeds ~1.3x, ...)
+                    channels[ch].gain_q8 =
+                        (dx7_midi::gm::program_gain(program) * 256.0) as u32;
                 }
             }
         }
@@ -982,23 +1161,24 @@ async fn usb_midi_pwm_synth(
 
     static MIDI_QUEUE: dx7_midi::MidiQueue = dx7_midi::MidiQueue::new();
 
-    // SysEx reception buffer (max 4104 bytes for DX7 32-voice bulk dump)
-    static mut SYSEX_RX_BUF: [u8; 4200] = [0u8; 4200];
-    static mut SYSEX_RX_POS: usize = 0;
-    static mut SYSEX_RX_ACTIVE: bool = false;
-
-    // SysEx voice bank storage (32 packed voices × 128 bytes)
-    static mut SYSEX_BANK: [u8; 4096] = [0u8; 4096];
-    static SYSEX_BANK_LOADED: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
+    // SysEx accumulator for the USB transport (see sysex module)
+    static USB_SYSEX: static_cell::StaticCell<sysex::SysexRx> = static_cell::StaticCell::new();
+    let usb_sysex = USB_SYSEX.init(sysex::SysexRx::new());
 
     // Task 1: USB device driver
     let usb_run = usb.run();
 
     // Task: CPU meter — sends CC 119 via USB MIDI every 500ms (async, never blocks render)
     let cpu_meter = async {
+        let mut last_drops = 0u32;
         loop {
             embassy_time::Timer::after_millis(500).await;
+            // MIDI queue overflow report (counted in push, logged here off the audio path)
+            let drops = MIDI_QUEUE.dropped();
+            if drops != last_drops {
+                info!("MIDI queue: {} messages dropped so far", drops);
+                last_drops = drops;
+            }
             let cycles = mc_render::RENDER_CYCLES_PEAK.swap(0, core::sync::atomic::Ordering::Relaxed);
             let pct = ((cycles as u64 * 127) / 266667).min(127) as u8;
             let packet = [0x0B, 0xB0, 119, pct];
@@ -1018,102 +1198,15 @@ async fn usb_midi_pwm_synth(
                         match cin {
                             0x04 => {
                                 // SysEx start or continue — 3 data bytes
-                                #[allow(static_mut_refs)]
-                                unsafe {
-                                    if chunk[1] == 0xF0 {
-                                        SYSEX_RX_POS = 0;
-                                        SYSEX_RX_ACTIVE = true;
-                                    }
-                                    if SYSEX_RX_ACTIVE {
-                                        for &b in &chunk[1..4] {
-                                            if SYSEX_RX_POS < SYSEX_RX_BUF.len() {
-                                                SYSEX_RX_BUF[SYSEX_RX_POS] = b;
-                                                SYSEX_RX_POS += 1;
-                                            }
-                                        }
-                                    }
+                                for &b in &chunk[1..4] {
+                                    usb_sysex.feed(b, &MIDI_QUEUE);
                                 }
                             }
                             0x05 | 0x06 | 0x07 => {
                                 // SysEx end: 1, 2, or 3 final bytes
-                                #[allow(static_mut_refs)]
-                                unsafe {
-                                    if SYSEX_RX_ACTIVE {
-                                        let count = (cin - 0x04) as usize; // 1, 2, or 3
-                                        for &b in &chunk[1..1 + count] {
-                                            if SYSEX_RX_POS < SYSEX_RX_BUF.len() {
-                                                SYSEX_RX_BUF[SYSEX_RX_POS] = b;
-                                                SYSEX_RX_POS += 1;
-                                            }
-                                        }
-                                        // Process complete SysEx
-                                        let len = SYSEX_RX_POS;
-                                        if len == 5
-                                            && SYSEX_RX_BUF[0] == 0xF0
-                                            && SYSEX_RX_BUF[1] == 0x7D
-                                            && SYSEX_RX_BUF[4] == 0xF7
-                                        {
-                                            match SYSEX_RX_BUF[2] {
-                                                0x01 => {
-                                                    // Mode switch: 0=DX7, 1=GM
-                                                    let mode = SYSEX_RX_BUF[3];
-                                                    SYNTH_MODE.store(mode, Ordering::Release);
-                                                    info!("Mode: {}", if mode == 0 { "DX7" } else { "GM" });
-                                                    // Kill all voices on mode switch
-                                                    for msg_ch in 0..16u8 {
-                                                        MIDI_QUEUE.push(dx7_midi::MidiMessage::ControlChange {
-                                                            channel: msg_ch, controller: 123, value: 0,
-                                                        });
-                                                    }
-                                                }
-                                                0x02 => {
-                                                    // Set MIDI channel (DX7 mode)
-                                                    let ch = SYSEX_RX_BUF[3];
-                                                    MIDI_CHANNEL.store(ch, Ordering::Release);
-                                                    if ch == 0x7F {
-                                                        info!("MIDI channel: OMNI");
-                                                    } else {
-                                                        info!("MIDI channel: {}", ch + 1);
-                                                    }
-                                                }
-                                                _ => {
-                                                    info!("SysEx: unknown cmd 0x{:02X}", SYSEX_RX_BUF[2]);
-                                                }
-                                            }
-                                        } else if len == 4104
-                                            && SYSEX_RX_BUF[0] == 0xF0
-                                            && SYSEX_RX_BUF[1] == 0x43
-                                            && (SYSEX_RX_BUF[2] & 0xF0) == 0x00
-                                            && SYSEX_RX_BUF[3] == 0x09
-                                            && SYSEX_RX_BUF[4] == 0x20
-                                            && SYSEX_RX_BUF[5] == 0x00
-                                            && SYSEX_RX_BUF[4103] == 0xF7
-                                        {
-                                            // DX7 32-voice bulk dump — verify checksum
-                                            let sum: u8 = SYSEX_RX_BUF[6..4102]
-                                                .iter()
-                                                .fold(0u8, |acc, &b| acc.wrapping_add(b));
-                                            let expected = (!sum).wrapping_add(1) & 0x7F;
-                                            if expected == SYSEX_RX_BUF[4102] {
-                                                SYSEX_BANK.copy_from_slice(
-                                                    &SYSEX_RX_BUF[6..4102],
-                                                );
-                                                SYSEX_BANK_LOADED.store(
-                                                    true,
-                                                    core::sync::atomic::Ordering::Release,
-                                                );
-                                                info!("SysEx: loaded 32-voice bank");
-                                            } else {
-                                                info!(
-                                                    "SysEx: checksum mismatch ({} vs {})",
-                                                    expected, SYSEX_RX_BUF[4102]
-                                                );
-                                            }
-                                        } else if len > 0 {
-                                            info!("SysEx: ignored ({} bytes)", len);
-                                        }
-                                        SYSEX_RX_ACTIVE = false;
-                                    }
+                                let count = (cin - 0x04) as usize;
+                                for &b in &chunk[1..1 + count] {
+                                    usb_sysex.feed(b, &MIDI_QUEUE);
                                 }
                             }
                             _ => {
@@ -1163,12 +1256,7 @@ async fn usb_midi_pwm_synth(
         loop {
             // Drain MIDI queue
             while let Some(msg) = MIDI_QUEUE.pop() {
-                let sysex_bank = if SYSEX_BANK_LOADED.load(core::sync::atomic::Ordering::Acquire) {
-                    #[allow(static_mut_refs)]
-                    Some(unsafe { &SYSEX_BANK })
-                } else {
-                    None
-                };
+                let sysex_bank = sysex::bank();
                 // SAFETY: dispatch phase — RENDER_DONE was observed true at the end of
                 // the previous block (or is the initial `true`) and RENDER_START has not
                 // been raised yet, so core 1 holds no reference into the pool. The
@@ -1193,9 +1281,11 @@ async fn usb_midi_pwm_synth(
                 if !v.is_finished() {
                     let mut voice_buf = [0i32; N];
                     v.render(&mut voice_buf);
-                    for i in 0..N {
-                        output[i] = qadd(output[i], voice_buf[i]);
-                    }
+                    mc_render::mix_voice(
+                        &mut output,
+                        &voice_buf,
+                        mc_render::VOICE_GAIN_Q8[idx].load(core::sync::atomic::Ordering::Relaxed),
+                    );
                 }
             }
 
@@ -1334,13 +1424,11 @@ async fn usb_ble_midi_pwm_synth(
 
     static MIDI_QUEUE: dx7_midi::MidiQueue = dx7_midi::MidiQueue::new();
 
-    // SysEx reception buffer (max 4104 bytes for DX7 32-voice bulk dump)
-    static mut SYSEX_RX_BUF: [u8; 4200] = [0u8; 4200];
-    static mut SYSEX_RX_POS: usize = 0;
-    static mut SYSEX_RX_ACTIVE: bool = false;
-    static mut SYSEX_BANK: [u8; 4096] = [0u8; 4096];
-    static SYSEX_BANK_LOADED: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
+    // SysEx accumulators, one per transport (see sysex module)
+    static USB_SYSEX: static_cell::StaticCell<sysex::SysexRx> = static_cell::StaticCell::new();
+    let usb_sysex = USB_SYSEX.init(sysex::SysexRx::new());
+    static BLE_SYSEX: static_cell::StaticCell<sysex::SysexRx> = static_cell::StaticCell::new();
+    let ble_sysex = BLE_SYSEX.init(sysex::SysexRx::new());
 
     // --- Setup USB MIDI ---
     let driver = Driver::new(usb_peripheral, Irqs);
@@ -1375,8 +1463,15 @@ async fn usb_ble_midi_pwm_synth(
 
     // Task: CPU meter — sends CC 119 via USB MIDI every 500ms (async, never blocks render)
     let cpu_meter = async {
+        let mut last_drops = 0u32;
         loop {
             embassy_time::Timer::after_millis(500).await;
+            // MIDI queue overflow report (counted in push, logged here off the audio path)
+            let drops = MIDI_QUEUE.dropped();
+            if drops != last_drops {
+                info!("MIDI queue: {} messages dropped so far", drops);
+                last_drops = drops;
+            }
             let cycles = mc_render::RENDER_CYCLES_PEAK.swap(0, core::sync::atomic::Ordering::Relaxed);
             // Budget: 64 samples at 48kHz = 266667 cycles at 200MHz
             let pct = ((cycles as u64 * 127) / 266667).min(127) as u8;
@@ -1397,96 +1492,16 @@ async fn usb_ble_midi_pwm_synth(
                         let cin = chunk[0] & 0x0F;
                         match cin {
                             0x04 => {
-                                #[allow(static_mut_refs)]
-                                unsafe {
-                                    if chunk[1] == 0xF0 {
-                                        SYSEX_RX_POS = 0;
-                                        SYSEX_RX_ACTIVE = true;
-                                    }
-                                    if SYSEX_RX_ACTIVE {
-                                        for &b in &chunk[1..4] {
-                                            if SYSEX_RX_POS < SYSEX_RX_BUF.len() {
-                                                SYSEX_RX_BUF[SYSEX_RX_POS] = b;
-                                                SYSEX_RX_POS += 1;
-                                            }
-                                        }
-                                    }
+                                // SysEx start or continue — 3 data bytes
+                                for &b in &chunk[1..4] {
+                                    usb_sysex.feed(b, &MIDI_QUEUE);
                                 }
                             }
                             0x05 | 0x06 | 0x07 => {
-                                #[allow(static_mut_refs)]
-                                unsafe {
-                                    if SYSEX_RX_ACTIVE {
-                                        let count = (cin - 0x04) as usize;
-                                        for &b in &chunk[1..1 + count] {
-                                            if SYSEX_RX_POS < SYSEX_RX_BUF.len() {
-                                                SYSEX_RX_BUF[SYSEX_RX_POS] = b;
-                                                SYSEX_RX_POS += 1;
-                                            }
-                                        }
-                                        let len = SYSEX_RX_POS;
-                                        if len == 5
-                                            && SYSEX_RX_BUF[0] == 0xF0
-                                            && SYSEX_RX_BUF[1] == 0x7D
-                                            && SYSEX_RX_BUF[4] == 0xF7
-                                        {
-                                            match SYSEX_RX_BUF[2] {
-                                                0x01 => {
-                                                    let mode = SYSEX_RX_BUF[3];
-                                                    SYNTH_MODE.store(mode, Ordering::Release);
-                                                    info!("Mode: {}", if mode == 0 { "DX7" } else { "GM" });
-                                                    for msg_ch in 0..16u8 {
-                                                        MIDI_QUEUE.push(dx7_midi::MidiMessage::ControlChange {
-                                                            channel: msg_ch, controller: 123, value: 0,
-                                                        });
-                                                    }
-                                                }
-                                                0x02 => {
-                                                    let ch = SYSEX_RX_BUF[3];
-                                                    MIDI_CHANNEL.store(ch, Ordering::Release);
-                                                    if ch == 0x7F {
-                                                        info!("MIDI channel: OMNI");
-                                                    } else {
-                                                        info!("MIDI channel: {}", ch + 1);
-                                                    }
-                                                }
-                                                _ => {
-                                                    info!("SysEx: unknown cmd 0x{:02X}", SYSEX_RX_BUF[2]);
-                                                }
-                                            }
-                                        } else if len == 4104
-                                            && SYSEX_RX_BUF[0] == 0xF0
-                                            && SYSEX_RX_BUF[1] == 0x43
-                                            && (SYSEX_RX_BUF[2] & 0xF0) == 0x00
-                                            && SYSEX_RX_BUF[3] == 0x09
-                                            && SYSEX_RX_BUF[4] == 0x20
-                                            && SYSEX_RX_BUF[5] == 0x00
-                                            && SYSEX_RX_BUF[4103] == 0xF7
-                                        {
-                                            let sum: u8 = SYSEX_RX_BUF[6..4102]
-                                                .iter()
-                                                .fold(0u8, |acc, &b| acc.wrapping_add(b));
-                                            let expected = (!sum).wrapping_add(1) & 0x7F;
-                                            if expected == SYSEX_RX_BUF[4102] {
-                                                SYSEX_BANK.copy_from_slice(
-                                                    &SYSEX_RX_BUF[6..4102],
-                                                );
-                                                SYSEX_BANK_LOADED.store(
-                                                    true,
-                                                    core::sync::atomic::Ordering::Release,
-                                                );
-                                                info!("SysEx: loaded 32-voice bank");
-                                            } else {
-                                                info!(
-                                                    "SysEx: checksum mismatch ({} vs {})",
-                                                    expected, SYSEX_RX_BUF[4102]
-                                                );
-                                            }
-                                        } else if len > 0 {
-                                            info!("SysEx: ignored ({} bytes)", len);
-                                        }
-                                        SYSEX_RX_ACTIVE = false;
-                                    }
+                                // SysEx end: 1, 2, or 3 final bytes
+                                let count = (cin - 0x04) as usize;
+                                for &b in &chunk[1..1 + count] {
+                                    usb_sysex.feed(b, &MIDI_QUEUE);
                                 }
                             }
                             _ => {
@@ -1567,6 +1582,9 @@ async fn usb_ble_midi_pwm_synth(
                 info!("BLE: connected!");
 
                 let gatt_conn = conn.with_attribute_server(&server).unwrap();
+                // Per-connection parser state (SysEx may span packets; running
+                // status does not).
+                let mut ble_parser = dx7_midi::ble::BleMidiParser::new();
 
                 loop {
                     match gatt_conn.next().await {
@@ -1579,7 +1597,9 @@ async fn usb_ble_midi_pwm_synth(
                             match event {
                                 GattEvent::Write(write_evt) => {
                                     let data = write_evt.data();
-                                    dx7_midi::ble::parse_ble_midi_packet(data, &MIDI_QUEUE);
+                                    // Channel messages go to the queue; SysEx bytes run through
+                                    // the same accumulator logic as USB (mode / channel / bank).
+                                    ble_parser.parse(data, &MIDI_QUEUE, &mut |b| ble_sysex.feed(b, &MIDI_QUEUE));
                                     let _ = write_evt.accept();
                                 }
                                 other => { let _ = other.accept(); }
@@ -1624,12 +1644,7 @@ async fn usb_ble_midi_pwm_synth(
             loop {
                 // Drain MIDI queue (fed by both USB and BLE)
                 while let Some(msg) = MIDI_QUEUE.pop() {
-                    let sysex_bank = if SYSEX_BANK_LOADED.load(core::sync::atomic::Ordering::Acquire) {
-                        #[allow(static_mut_refs)]
-                        Some(unsafe { &SYSEX_BANK })
-                    } else {
-                        None
-                    };
+                    let sysex_bank = sysex::bank();
                     // SAFETY: dispatch phase — RENDER_DONE was observed true at the end of
                     // the previous block (or is the initial `true`) and RENDER_START has not
                     // been raised yet, so core 1 holds no reference into the pool. The
@@ -1654,9 +1669,11 @@ async fn usb_ble_midi_pwm_synth(
                     if !v.is_finished() {
                         let mut voice_buf = [0i32; N];
                         v.render(&mut voice_buf);
-                        for i in 0..N {
-                            output[i] = qadd(output[i], voice_buf[i]);
-                        }
+                        mc_render::mix_voice(
+                            &mut output,
+                            &voice_buf,
+                            mc_render::VOICE_GAIN_Q8[idx].load(core::sync::atomic::Ordering::Relaxed),
+                        );
                     }
                 }
 
@@ -1795,6 +1812,10 @@ async fn ble_midi_pwm_synth(
 
     static MIDI_QUEUE: dx7_midi::MidiQueue = dx7_midi::MidiQueue::new();
 
+    // SysEx accumulator for the BLE transport (see sysex module)
+    static BLE_SYSEX: static_cell::StaticCell<sysex::SysexRx> = static_cell::StaticCell::new();
+    let ble_sysex = BLE_SYSEX.init(sysex::SysexRx::new());
+
     // Task 1: CYW43 background driver (must run continuously)
     let cyw43_task = runner.run();
 
@@ -1868,6 +1889,9 @@ async fn ble_midi_pwm_synth(
                 info!("BLE: connected!");
 
                 let gatt_conn = conn.with_attribute_server(&server).unwrap();
+                // Per-connection parser state (SysEx may span packets; running
+                // status does not).
+                let mut ble_parser = dx7_midi::ble::BleMidiParser::new();
 
                 loop {
                     match gatt_conn.next().await {
@@ -1880,7 +1904,9 @@ async fn ble_midi_pwm_synth(
                             match event {
                                 GattEvent::Write(write_evt) => {
                                     let data = write_evt.data();
-                                    dx7_midi::ble::parse_ble_midi_packet(data, &MIDI_QUEUE);
+                                    // Channel messages go to the queue; SysEx bytes run through
+                                    // the same accumulator logic as USB (mode / channel / bank).
+                                    ble_parser.parse(data, &MIDI_QUEUE, &mut |b| ble_sysex.feed(b, &MIDI_QUEUE));
                                     let _ = write_evt.accept();
                                 }
                                 other => { let _ = other.accept(); }
@@ -1930,7 +1956,7 @@ async fn ble_midi_pwm_synth(
                 // been raised yet, so core 1 holds no reference into the pool. The
                 // borrow ends with this statement, before RENDER_START below.
                 let voices = unsafe { mc_render::VOICES.all() };
-                dispatch_midi(msg, voices, &mut voice_ages, &mut voice_age, &mut channels, None,
+                dispatch_midi(msg, voices, &mut voice_ages, &mut voice_age, &mut channels, sysex::bank(),
                     SYNTH_MODE.load(Ordering::Acquire));
             }
 
@@ -1949,9 +1975,11 @@ async fn ble_midi_pwm_synth(
                 if !v.is_finished() {
                     let mut voice_buf = [0i32; N];
                     v.render(&mut voice_buf);
-                    for i in 0..N {
-                        output[i] = qadd(output[i], voice_buf[i]);
-                    }
+                    mc_render::mix_voice(
+                        &mut output,
+                        &voice_buf,
+                        mc_render::VOICE_GAIN_Q8[idx].load(core::sync::atomic::Ordering::Relaxed),
+                    );
                 }
             }
 
