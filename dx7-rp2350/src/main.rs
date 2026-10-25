@@ -142,6 +142,22 @@ impl OutputFilterF32 {
     }
 }
 
+/// Soft clipper: Pade approximation of tanh, `x * (27 + x^2) / (27 + 9 x^2)`.
+///
+/// The rational form reaches exactly 1.0 at |x| = 3 (108/108) and is monotonic
+/// on [-3, 3], so clamping there is continuous. Clamping at |x| = 1 (as before)
+/// jumped from f(1) = 28/36 ~ 0.778 straight to 1.0 — a 0.22 step at the knee.
+#[inline(always)]
+fn soft_clip(x: f32) -> f32 {
+    if x > 3.0 {
+        1.0
+    } else if x < -3.0 {
+        -1.0
+    } else {
+        x * (27.0 + x * x) / (27.0 + 9.0 * x * x)
+    }
+}
+
 // --- Cortex-M33 DSP intrinsics ---
 
 /// Saturating 32-bit signed add (QADD instruction, 1 cycle).
@@ -1090,19 +1106,14 @@ async fn usb_midi_pwm_synth(
 
             // Convert to f32, apply DC blocker + LPF, then scale to 10-bit PWM duty
             for i in 0..N {
-                // Convert i32 to f32. Single voice peaks ±2^26.
-                // Divide by 2^26 * 3 for 8-voice mix — soft-clip handles peaks.
+                // Convert i32 to f32. A single voice peaks at ±2^26, so dividing
+                // by 2^26 * MAX_VOICES puts a full MAX_VOICES-voice mix at ±1.0
+                // (one voice alone sits at 1/MAX_VOICES of full scale, ~-20 dBFS
+                // for 10 voices). The soft clipper only engages on louder peaks.
                 let sample_f32 = output[i] as f32 / (67108864.0 * MAX_VOICES as f32);
                 let filtered = filter.process(sample_f32);
                 // Soft clip: tanh approximation (smooth limiting, no harsh distortion)
-                let x = filtered;
-                let soft = if x > 1.0 {
-                    1.0
-                } else if x < -1.0 {
-                    -1.0
-                } else {
-                    x * (27.0 + x * x) / (27.0 + 9.0 * x * x)
-                };
+                let soft = soft_clip(filtered);
                 // Scale to 10-bit PWM: ±1.0 → ±512, center at 512
                 let duty = (soft * 512.0 + 512.5) as i32;
                 duties[i] = usat::<10>(duty) as u16;
@@ -1548,14 +1559,7 @@ async fn usb_ble_midi_pwm_synth(
                 for i in 0..N {
                     let sample_f32 = output[i] as f32 / (67108864.0 * MAX_VOICES as f32);
                     let filtered = filter.process(sample_f32);
-                    let x = filtered;
-                    let soft = if x > 1.0 {
-                        1.0
-                    } else if x < -1.0 {
-                        -1.0
-                    } else {
-                        x * (27.0 + x * x) / (27.0 + 9.0 * x * x)
-                    };
+                    let soft = soft_clip(filtered);
                     let duty = (soft * 512.0 + 512.5) as i32;
                     duties[i] = usat::<10>(duty) as u16;
                 }
@@ -1846,14 +1850,7 @@ async fn ble_midi_pwm_synth(
             for i in 0..N {
                 let sample_f32 = output[i] as f32 / (67108864.0 * MAX_VOICES as f32);
                 let filtered = filter.process(sample_f32);
-                let x = filtered;
-                let soft = if x > 1.0 {
-                    1.0
-                } else if x < -1.0 {
-                    -1.0
-                } else {
-                    x * (27.0 + x * x) / (27.0 + 9.0 * x * x)
-                };
+                let soft = soft_clip(filtered);
                 let duty = (soft * 512.0 + 512.5) as i32;
                 duties[i] = usat::<10>(duty) as u16;
             }
