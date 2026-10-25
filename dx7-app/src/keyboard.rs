@@ -1,7 +1,14 @@
 //! Computer keyboard → MIDI note mapping using crossterm.
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
+use crossterm::{execute, terminal};
 use std::collections::HashMap;
+use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Once;
 use std::time::Duration;
 
 /// Keyboard handler that maps computer keys to MIDI notes.
@@ -65,6 +72,12 @@ impl KeyboardHandler {
 
         match key.kind {
             KeyEventKind::Press => {
+                // Ctrl-C arrives as Char('c') + CONTROL in raw mode.
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    events.push(KeyboardEvent::Quit);
+                    return events;
+                }
+
                 // Check for special keys first
                 match key.code {
                     KeyCode::Char('z') => {
@@ -125,4 +138,86 @@ pub enum KeyboardEvent {
     OctaveChange(i8),
     PatchChange(u8),
     Quit,
+}
+
+// ── Terminal raw-mode guard ──────────────────────────────────────────
+
+/// Whether raw mode is currently enabled by us.
+static RAW_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Whether we pushed keyboard-enhancement flags that must be popped.
+static ENHANCEMENT_PUSHED: AtomicBool = AtomicBool::new(false);
+static PANIC_HOOK_INSTALLED: Once = Once::new();
+
+/// Undo whatever terminal state we set up. Idempotent and safe to call
+/// from a panic hook.
+fn restore_terminal() {
+    if ENHANCEMENT_PUSHED.swap(false, Ordering::SeqCst) {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
+    if RAW_MODE_ACTIVE.swap(false, Ordering::SeqCst) {
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+/// RAII guard for terminal raw mode.
+///
+/// On creation it enables raw mode and, when the terminal supports the
+/// kitty keyboard protocol, pushes `REPORT_EVENT_TYPES` so that key
+/// *release* events are delivered (crossterm only reports releases on
+/// Unix when this flag is active). On drop — including during panic
+/// unwinding — it pops the flags and restores cooked mode. A panic hook
+/// is also installed so the panic message itself is printed on a sane
+/// terminal rather than inside raw mode.
+pub struct RawModeGuard {
+    release_supported: bool,
+}
+
+impl RawModeGuard {
+    /// Enter raw mode and enable key-release reporting where available.
+    pub fn enter() -> io::Result<Self> {
+        PANIC_HOOK_INSTALLED.call_once(|| {
+            let prev = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                restore_terminal();
+                prev(info);
+            }));
+        });
+
+        terminal::enable_raw_mode()?;
+        RAW_MODE_ACTIVE.store(true, Ordering::SeqCst);
+
+        // Must be queried after raw mode is on, otherwise the terminal's
+        // reply would be echoed / line-buffered.
+        let release_supported = match terminal::supports_keyboard_enhancement() {
+            Ok(true) => {
+                match execute!(
+                    io::stdout(),
+                    PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+                ) {
+                    Ok(()) => {
+                        ENHANCEMENT_PUSHED.store(true, Ordering::SeqCst);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+            _ => false,
+        };
+
+        Ok(RawModeGuard { release_supported })
+    }
+
+    /// True when the terminal reports key-release events, so NoteOff
+    /// fires on key lift. False on terminals without the kitty keyboard
+    /// protocol (e.g. macOS Terminal.app), where notes sustain until the
+    /// same key is pressed again.
+    pub fn release_supported(&self) -> bool {
+        self.release_supported
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
 }

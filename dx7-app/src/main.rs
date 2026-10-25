@@ -16,7 +16,6 @@ mod midi;
 mod rtpmidi;
 
 use clap::Parser;
-use crossterm::terminal;
 use dx7_core::{get_rom1a_preset, DxVoice, SynthCommand};
 use std::time::Duration;
 use std::io::Write;
@@ -1004,10 +1003,25 @@ fn run_interactive(initial_patch: DxVoice, patches: Vec<DxVoice>, args: &Args) {
     println!("  WETYUOP    = black keys");
     println!("  Z/X        = octave down/up");
     println!("  1-9,0      = select patch");
-    println!("  Q/Esc      = quit");
+    println!("  Q/Esc/^C   = quit");
     println!();
 
-    terminal::enable_raw_mode().expect("Failed to enable raw mode");
+    // RAII guard: restores cooked mode (and pops keyboard-enhancement
+    // flags) on drop, including during a panic.
+    let raw_guard = match keyboard::RawModeGuard::enter() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("Failed to enable raw mode: {e}");
+            return;
+        }
+    };
+    if !raw_guard.release_supported() {
+        print!(
+            "  Note: this terminal does not report key release events;\r\n\
+             notes sustain until the same key is pressed again.\r\n"
+        );
+        let _ = std::io::stdout().flush();
+    }
 
     let mut kbd = keyboard::KeyboardHandler::new();
 
@@ -1039,8 +1053,8 @@ fn run_interactive(initial_patch: DxVoice, patches: Vec<DxVoice>, args: &Args) {
                     }
                 }
                 keyboard::KeyboardEvent::Quit => {
-                    terminal::disable_raw_mode().ok();
-                    println!("\r\nBye!");
+                    drop(raw_guard);
+                    println!("\nBye!");
                     return;
                 }
             }
