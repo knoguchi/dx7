@@ -5,6 +5,7 @@
 
 use crate::generated_tables;
 use crate::tables;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// LFO waveform types.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -67,28 +68,22 @@ impl Default for LfoParams {
 }
 
 /// Static LFO parameters derived from sample rate (shared across all voices).
-static mut LFO_UNIT: u32 = 0;
-static mut LFO_RATIO: u32 = 0;
+/// Defaults are the 44100 Hz values so an un-initialised LFO is still sane.
+static LFO_UNIT: AtomicU32 = AtomicU32::new(36559);
+static LFO_RATIO: AtomicU32 = AtomicU32::new(6440362);
 
-/// Initialize LFO statics (called once from init_tables flow).
+/// Initialize LFO statics (called from the init_tables flow). Safe to call
+/// repeatedly; the most recent sample rate wins.
 /// Only 44100 and 48000 Hz are supported.
 pub fn init_lfo(sample_rate: u32) {
-    unsafe {
-        match sample_rate {
-            48000 => {
-                // N * 25190424 / 48000 + 0.5 = 33587
-                LFO_UNIT = 33587;
-                // 4437500000 * N / 48000 = 5916666
-                LFO_RATIO = 5916666;
-            }
-            _ => {
-                // N * 25190424 / 44100 + 0.5 = 36559
-                LFO_UNIT = 36559;
-                // 4437500000 * N / 44100 = 6440362
-                LFO_RATIO = 6440362;
-            }
-        }
-    }
+    let (unit, ratio) = match sample_rate {
+        // N * 25190424 / 48000 + 0.5 = 33587 ; 4437500000 * N / 48000 = 5916666
+        48000 => (33587, 5916666),
+        // N * 25190424 / 44100 + 0.5 = 36559 ; 4437500000 * N / 44100 = 6440362
+        _ => (36559, 6440362),
+    };
+    LFO_UNIT.store(unit, Ordering::Release);
+    LFO_RATIO.store(ratio, Ordering::Release);
 }
 
 /// DX7 integer LFO state.
@@ -121,12 +116,14 @@ impl Lfo {
     /// `params` layout: [speed, delay, pmd, amd, sync, waveform]
     pub fn reset(&mut self, lfo_params: &LfoParams) {
         let rate = lfo_params.speed.min(99) as usize;
-        let lforatio = unsafe { LFO_RATIO };
+        let lforatio = LFO_RATIO.load(Ordering::Relaxed);
         // LFO_SOURCE_FIXED is Q24; multiply and shift back.
         self.delta = ((generated_tables::LFO_SOURCE_FIXED[rate] as u64 * lforatio as u64) >> 24) as u32;
 
-        let a_raw = 99i32 - lfo_params.delay as i32;
-        let unit = unsafe { LFO_UNIT };
+        // delay is clamped so the shift below stays non-negative even for
+        // out-of-range patch data.
+        let a_raw = 99i32 - lfo_params.delay.min(99) as i32;
+        let unit = LFO_UNIT.load(Ordering::Relaxed);
         if a_raw == 99 {
             self.delayinc = !0u32;
             self.delayinc2 = !0u32;

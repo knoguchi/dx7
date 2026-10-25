@@ -3,6 +3,8 @@
 //! Based on MSFA pitchenv.cc (Apache 2.0, Google Inc.).
 //! Output is in Q24/octave format.
 
+use core::sync::atomic::{AtomicI32, Ordering};
+
 /// Pitch envelope rate table (maps DX7 rate 0..99 to internal rate).
 static PITCHENV_RATE: [u8; 100] = [
     1, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12,
@@ -24,20 +26,20 @@ static PITCHENV_TAB: [i8; 100] = [
     82, 92, 103, 115, 127,
 ];
 
-/// Static unit derived from sample rate.
-static mut PITCHENV_UNIT: i32 = 0;
+/// Static unit derived from sample rate (defaults to the 44100 Hz value).
+static PITCHENV_UNIT: AtomicI32 = AtomicI32::new(1143);
 
-/// Initialize pitch envelope statics (called once from init_tables flow).
+/// Initialize pitch envelope statics (called from the init_tables flow).
+/// Safe to call repeatedly; the most recent sample rate wins.
 /// Only 44100 and 48000 Hz are supported.
 pub fn init_pitchenv(sample_rate: u32) {
-    unsafe {
-        PITCHENV_UNIT = match sample_rate {
-            // N * (1<<24) / (21.3 * 48000) + 0.5 = 1049
-            48000 => 1049,
-            // N * (1<<24) / (21.3 * 44100) + 0.5 = 1143
-            _ => 1143,
-        };
-    }
+    let unit = match sample_rate {
+        // N * (1<<24) / (21.3 * 48000) + 0.5 = 1049
+        48000 => 1049,
+        // N * (1<<24) / (21.3 * 44100) + 0.5 = 1143
+        _ => 1143,
+    };
+    PITCHENV_UNIT.store(unit, Ordering::Release);
 }
 
 /// DX7 pitch envelope generator.
@@ -113,7 +115,7 @@ impl PitchEnv {
             let newlevel = self.levels[self.ix as usize];
             self.targetlevel = (PITCHENV_TAB[newlevel as usize] as i32) << 19;
             self.rising = self.targetlevel > self.level;
-            let unit = unsafe { PITCHENV_UNIT };
+            let unit = PITCHENV_UNIT.load(Ordering::Relaxed);
             self.inc = PITCHENV_RATE[self.rates[self.ix as usize] as usize] as i32 * unit;
         }
     }
