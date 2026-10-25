@@ -1,0 +1,19 @@
+DX7 FM synthesizer emulator in Rust
+Copyright 2026 Kenji Noguchi
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This project contains code derived from or based on:
+
+- Music Synthesizer for Android (MSFA), Copyright 2012-2014 Google Inc.,
+  Apache License 2.0. Envelope generator, LFO, pitch envelope, frequency
+  and scaling tables, and the bus-flag algorithm routing in dx7-core.
+- Freeverb by Jezar at Dreampoint, public domain. Reverb in dx7-core/effects.
+- The log-domain sine/exponential operator technique as documented by the
+  OPL3 FPGA project (gtaylormb/opl3_fpga). Implementation is original.
+
+The ROM1A factory voice data embedded in dx7-core (rom1a.rs) and the GM
+sound set compiled from community patch banks in dx7-midi (gm_rom.rs) are
+parameter sets for the Yamaha DX7, distributed for interoperability. Yamaha
+is a trademark of Yamaha Corporation; this project is not affiliated with
+or endorsed by Yamaha.

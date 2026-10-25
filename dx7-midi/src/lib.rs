@@ -1,3 +1,8 @@
+//! `no_std` MIDI building blocks for the `dx7-core` synthesizer: USB-MIDI and
+//! BLE-MIDI packet parsers, a fixed-size message queue, and a General MIDI
+//! program map onto a compiled DX7 sound set.
+
+
 #![cfg_attr(not(test), no_std)]
 
 pub mod ble;

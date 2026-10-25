@@ -2,6 +2,16 @@
 name = "dx7-midi"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.82"
+authors = ["Kenji Noguchi <tokyo246@gmail.com>"]
+description = "no_std MIDI building blocks for the dx7-core synth: USB-MIDI and BLE-MIDI packet parsers, a lock-free message queue, and a 128-program General MIDI sound set of DX7 patches."
+readme = "README.md"
+license = "Apache-2.0"
+repository = "https://github.com/knoguchi/dx7"
+homepage = "https://github.com/knoguchi/dx7"
+documentation = "https://docs.rs/dx7-midi"
+keywords = ["dx7", "midi", "ble-midi", "usb-midi", "no-std"]
+categories = ["multimedia::audio", "no-std", "embedded"]
 
 [dependencies]
-dx7-core = { path = "../dx7-core", default-features = false }
+dx7-core = { version = "0.1.0", path = "../dx7-core", default-features = false }

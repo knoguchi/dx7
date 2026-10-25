@@ -2,7 +2,17 @@
 name = "dx7-core"
 version = "0.1.0"
 edition = "2021"
-description = "DX7 FM synthesizer engine — platform-independent library"
+rust-version = "1.82"
+authors = ["Kenji Noguchi <tokyo246@gmail.com>"]
+description = "Yamaha DX7 FM synthesizer engine: integer log-domain operators, MSFA-accurate envelopes, SysEx patch parsing. no_std, zero dependencies."
+readme = "README.md"
+license = "Apache-2.0"
+repository = "https://github.com/knoguchi/dx7"
+homepage = "https://github.com/knoguchi/dx7"
+documentation = "https://docs.rs/dx7-core"
+keywords = ["dx7", "fm", "synthesizer", "audio", "no-std"]
+categories = ["multimedia::audio", "no-std", "embedded"]
+exclude = ["tests/dump_epiano.rs"]
 
 [features]
 default = ["std"]
@@ -11,3 +21,7 @@ std = []
 [[bin]]
 name = "gen_tables"
 path = "src/bin/gen_tables.rs"
+required-features = ["std"]
+
+[package.metadata.docs.rs]
+all-features = true
