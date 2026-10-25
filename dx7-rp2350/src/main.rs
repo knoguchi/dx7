@@ -409,6 +409,13 @@ mod cyw43_fw {
 
 // --- Voice dispatch (shared by all entry points) ---
 
+/// Apply one MIDI message to the voice pool.
+///
+/// This runs on core 0 inside the audio render task, between blocks. It must
+/// stay free of defmt logging: even with defmt-rtt's `disable-blocking-mode`
+/// (enabled in Cargo.toml so a UF2 deployment with no probe can never stall
+/// on a full RTT buffer) a log call costs a critical section plus formatting
+/// time that comes straight out of the 1333 us block budget.
 #[cfg(all(any(feature = "usb-midi", feature = "ble-midi"), feature = "pwm"))]
 fn dispatch_midi(
     msg: dx7_midi::MidiMessage,
@@ -628,14 +635,12 @@ fn dispatch_midi(
                         let mut voice_data = [0u8; 128];
                         voice_data.copy_from_slice(&bank[start..start + 128]);
                         channels[0].patch = dx7_core::DxVoice::from_packed(&voice_data);
-                        defmt::info!("DX7 sysex patch {}", idx);
                     }
                 } else if let Some(p) = dx7_core::load_rom1a_voice(program as usize) {
                     channels[0].patch = p;
-                    defmt::info!("DX7 ROM1A patch {}", program);
-                } else {
-                    defmt::info!("DX7 patch {} out of range", program);
                 }
+                // Out-of-range program: ignored. No logging here — this runs
+                // inside the audio render task (see module note on defmt).
             } else {
                 // GM mode: per-channel patch
                 let ch = channel as usize;
@@ -646,11 +651,9 @@ fn dispatch_midi(
                         let mut voice_data = [0u8; 128];
                         voice_data.copy_from_slice(&bank[start..start + 128]);
                         channels[ch].patch = dx7_core::DxVoice::from_packed(&voice_data);
-                        defmt::info!("Ch{} loaded sysex patch {}", ch, idx);
                     }
                 } else {
                     channels[ch].patch = dx7_midi::gm::gm_voice(program);
-                    defmt::info!("Ch{} GM program {}", ch, program);
                 }
             }
         }
