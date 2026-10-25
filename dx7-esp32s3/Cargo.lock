@@ -161,15 +161,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cst816s"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "967157b54d63f79ed49d548182e4bef967145e6627b21d7f67740d0aab243b2e"
-dependencies = [
- "embedded-hal 1.0.0",
-]
-
-[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -327,13 +318,13 @@ version = "0.1.0"
 name = "dx7-esp32s3"
 version = "0.1.0"
 dependencies = [
- "cst816s",
  "display-interface-spi",
  "dx7-core",
  "dx7-midi",
  "embassy-executor",
  "embassy-futures",
  "embassy-sync 0.7.2",
+ "embassy-time",
  "embassy-usb",
  "embedded-graphics",
  "embedded-hal 1.0.0",
@@ -348,7 +339,6 @@ dependencies = [
  "gc9a01-rs",
  "static_cell",
  "trouble-host",
- "xtensa-lx",
 ]
 
 [[package]]
