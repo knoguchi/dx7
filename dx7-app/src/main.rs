@@ -853,11 +853,11 @@ fn render_midi_file(
                 synths[ch].control_change(*cc, *value);
             }
             MidiEventKind::PitchBend { value } => {
-                // GM default pitch bend range is ±2 semitones.
-                // DX7 native range is ±12 semitones.
-                // Scale: 2/12 = 1/6.
-                let scaled = (*value as i32 / 6) as i16;
-                synths[ch].pitch_bend(scaled);
+                // The engine applies its own bend range (default 2 semitones,
+                // the GM default; RPN 0 in the file can change it), so the raw
+                // 14-bit value is passed through. Live input uses the same
+                // path, so both sound identical for the same data.
+                synths[ch].pitch_bend(*value);
             }
             MidiEventKind::ProgramChange { program } => {
                 // Skip ProgramChange for channels with --ch overrides
