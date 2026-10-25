@@ -80,6 +80,12 @@ impl DxVoice {
     /// Parse a single voice from unpacked format (155 bytes).
     /// This is the format used in single voice SysEx dumps.
     /// Operators are stored OP6-first: index 0 = OP6, matching DX7 SysEx convention.
+    ///
+    /// Every field that indexes a lookup table or selects a shift amount is
+    /// masked/clamped to its DX7 range so that corrupt or non-standard dumps
+    /// can never panic the engine. Operator EG rates/levels, scaling depths
+    /// and output level pass through with a 7-bit mask only, matching DX7
+    /// firmware behaviour (values above 99 give "overdriven" operators).
     pub fn from_unpacked(data: &[u8; 155]) -> Self {
         let mut ops = [OperatorParams::default(); 6];
 
@@ -89,22 +95,32 @@ impl DxVoice {
             let base = i * 21;
             ops[op_idx] = OperatorParams {
                 eg: EnvParams {
-                    rates: [data[base], data[base + 1], data[base + 2], data[base + 3]],
-                    levels: [data[base + 4], data[base + 5], data[base + 6], data[base + 7]],
+                    rates: [
+                        data[base] & 0x7F,
+                        data[base + 1] & 0x7F,
+                        data[base + 2] & 0x7F,
+                        data[base + 3] & 0x7F,
+                    ],
+                    levels: [
+                        data[base + 4] & 0x7F,
+                        data[base + 5] & 0x7F,
+                        data[base + 6] & 0x7F,
+                        data[base + 7] & 0x7F,
+                    ],
                 },
-                kbd_level_scaling_break_point: data[base + 8],
-                kbd_level_scaling_left_depth: data[base + 9],
-                kbd_level_scaling_right_depth: data[base + 10],
+                kbd_level_scaling_break_point: data[base + 8] & 0x7F,
+                kbd_level_scaling_left_depth: data[base + 9] & 0x7F,
+                kbd_level_scaling_right_depth: data[base + 10] & 0x7F,
                 kbd_level_scaling_left_curve: ScalingCurve::from_u8(data[base + 11]),
                 kbd_level_scaling_right_curve: ScalingCurve::from_u8(data[base + 12]),
-                kbd_rate_scaling: data[base + 13],
-                amp_mod_sensitivity: data[base + 14],
-                key_velocity_sensitivity: data[base + 15],
-                output_level: data[base + 16],
-                osc_mode: data[base + 17],
-                osc_freq_coarse: data[base + 18],
-                osc_freq_fine: data[base + 19],
-                osc_detune: data[base + 20],
+                kbd_rate_scaling: data[base + 13] & 0x07,
+                amp_mod_sensitivity: data[base + 14] & 0x03,
+                key_velocity_sensitivity: data[base + 15] & 0x07,
+                output_level: data[base + 16] & 0x7F,
+                osc_mode: data[base + 17] & 0x01,
+                osc_freq_coarse: data[base + 18] & 0x1F,
+                osc_freq_fine: (data[base + 19] & 0x7F).min(99),
+                osc_detune: data[base + 20] & 0x0F,
             };
         }
 
@@ -113,22 +129,32 @@ impl DxVoice {
         DxVoice {
             operators: ops,
             pitch_eg: EnvParams {
-                rates: [data[gb], data[gb + 1], data[gb + 2], data[gb + 3]],
-                levels: [data[gb + 4], data[gb + 5], data[gb + 6], data[gb + 7]],
+                rates: [
+                    normparm(data[gb] & 0x7F, 99),
+                    normparm(data[gb + 1] & 0x7F, 99),
+                    normparm(data[gb + 2] & 0x7F, 99),
+                    normparm(data[gb + 3] & 0x7F, 99),
+                ],
+                levels: [
+                    normparm(data[gb + 4] & 0x7F, 99),
+                    normparm(data[gb + 5] & 0x7F, 99),
+                    normparm(data[gb + 6] & 0x7F, 99),
+                    normparm(data[gb + 7] & 0x7F, 99),
+                ],
             },
-            algorithm: data[gb + 8],
-            feedback: data[gb + 9],
+            algorithm: data[gb + 8] & 0x1F,
+            feedback: data[gb + 9] & 0x07,
             osc_key_sync: data[gb + 10] != 0,
             lfo: LfoParams {
-                speed: data[gb + 11],
-                delay: data[gb + 12],
-                pitch_mod_depth: data[gb + 13],
-                amp_mod_depth: data[gb + 14],
+                speed: normparm(data[gb + 11] & 0x7F, 99),
+                delay: normparm(data[gb + 12] & 0x7F, 99),
+                pitch_mod_depth: normparm(data[gb + 13] & 0x7F, 99),
+                amp_mod_depth: normparm(data[gb + 14] & 0x7F, 99),
                 key_sync: data[gb + 15] != 0,
                 waveform: LfoWaveform::from_u8(data[gb + 16]),
             },
-            pitch_mod_sensitivity: data[gb + 17],
-            transpose: data[gb + 18],
+            pitch_mod_sensitivity: data[gb + 17] & 0x07,
+            transpose: normparm(data[gb + 18] & 0x7F, 48),
             name: {
                 let mut name = [b' '; 10];
                 name.copy_from_slice(&data[gb + 19..gb + 29]);
@@ -325,7 +351,8 @@ impl DxVoice {
             let osc_mode = mode_coarse & 0x01;
             let freq_coarse = (mode_coarse >> 1) & 0x1F;
 
-            let freq_fine = data[base + 16] & 0x7F;
+            // Fine indexes a 100-entry table; clamp rather than wrap.
+            let freq_fine = (data[base + 16] & 0x7F).min(99);
 
             ops[op_idx] = OperatorParams {
                 eg,
@@ -433,22 +460,9 @@ impl DxVoice {
             return Err("Data too short");
         }
 
-        // Verify checksum: two's complement of sum of voice data, AND 0x7F
-        let sum: u8 = data[voice_data_start..voice_data_end]
-            .iter()
-            .fold(0u8, |acc, &b| acc.wrapping_add(b));
-        let expected_checksum = (!sum).wrapping_add(1) & 0x7F;
-        let actual_checksum = data[voice_data_end];
-
-        if actual_checksum != expected_checksum {
-            // Be lenient — some SysEx files have different checksum conventions
-            // Just warn but continue
-        }
-
-        // Check SysEx end
-        if data[voice_data_end + 1] != 0xF7 {
-            // Also be lenient here
-        }
+        // Checksum and trailing F7 are deliberately not enforced here: many
+        // bank files in the wild use other conventions. Callers that want to
+        // warn can use `bulk_dump_checksum_ok`.
 
         // Parse 32 voices, each 128 bytes
         let mut voices = Vec::with_capacity(32);
@@ -460,6 +474,22 @@ impl DxVoice {
         }
 
         Ok(voices)
+    }
+
+    /// Returns true if a 32-voice bulk dump has a valid DX7 checksum
+    /// (two's complement of the 4096 data bytes, masked to 7 bits) and a
+    /// trailing F7. Returns false for data that is too short.
+    pub fn bulk_dump_checksum_ok(data: &[u8]) -> bool {
+        let start = 6;
+        let end = start + 4096;
+        if data.len() < end + 2 {
+            return false;
+        }
+        let sum = data[start..end]
+            .iter()
+            .fold(0u8, |acc, &b| acc.wrapping_add(b));
+        let expected = (!sum).wrapping_add(1) & 0x7F;
+        data[end] == expected && data[end + 1] == 0xF7
     }
 
     /// Raw packed 128 bytes of "Flunk bass" (voice 25 from vrc107b.syx).
@@ -570,6 +600,68 @@ pub(crate) mod tests {
         assert_eq!(v.lfo.speed, 35);
         assert_eq!(v.lfo.delay, 0);
         assert_eq!(v.pitch_mod_sensitivity, 3);
+    }
+
+    fn ensure_init() {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            crate::tables::init_tables(44100);
+            crate::lfo::init_lfo(44100);
+            crate::pitchenv::init_pitchenv(44100);
+        });
+    }
+
+    /// Note-on and render one block; panics propagate to the test.
+    fn exercise(v: &DxVoice) {
+        let mut voice = crate::voice::Voice::new();
+        voice.note_on(v, 60, 100);
+        let mut buf = [0i32; crate::tables::N];
+        voice.render(&mut buf);
+        voice.note_on(v, 127, 127);
+        voice.render(&mut buf);
+    }
+
+    /// Issue #3: every byte value in every slot of a packed voice must parse
+    /// and render without panicking (bank dumps arrive over MIDI unvalidated).
+    #[test]
+    fn test_packed_any_byte_value_never_panics() {
+        ensure_init();
+        for slot in 0..128 {
+            for val in 0..=255u8 {
+                let mut d = DxVoice::FLUNK_BASS_PACKED;
+                d[slot] = val;
+                exercise(&DxVoice::from_packed(&d));
+            }
+        }
+    }
+
+    /// Issue #3: same for the 155-byte unpacked single-voice format.
+    #[test]
+    fn test_unpacked_any_byte_value_never_panics() {
+        ensure_init();
+        let base = DxVoice::init_voice().to_unpacked();
+        for slot in 0..155 {
+            for val in 0..=255u8 {
+                let mut d = [0u8; 155];
+                d.copy_from_slice(&base[..155]);
+                d[slot] = val;
+                exercise(&DxVoice::from_unpacked(&d));
+            }
+        }
+    }
+
+    #[test]
+    fn test_bulk_dump_checksum() {
+        let mut dump = vec![0xF0, 0x43, 0x00, 0x09, 0x20, 0x00];
+        dump.extend(std::iter::repeat(0x11u8).take(4096));
+        let sum = (0x11u32 * 4096) as u8;
+        dump.push((!sum).wrapping_add(1) & 0x7F);
+        dump.push(0xF7);
+        assert!(DxVoice::bulk_dump_checksum_ok(&dump));
+        dump[4102] ^= 0x01;
+        assert!(!DxVoice::bulk_dump_checksum_ok(&dump));
+        assert!(!DxVoice::bulk_dump_checksum_ok(&dump[..100]));
     }
 
     #[test]
