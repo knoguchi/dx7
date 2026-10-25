@@ -5,7 +5,9 @@ use dx7_core::{DxVoice, SynthCommand};
 use midir::{MidiInput, MidiInputConnection};
 use ringbuf::traits::Producer;
 use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// A channel-voice MIDI message decoded from a live input.
 ///
@@ -36,17 +38,68 @@ pub enum MidiMessageKind {
 pub struct CommandSink {
     tx: Arc<Mutex<ringbuf::HeapProd<SynthCommand>>>,
     patches: Vec<DxVoice>,
+    /// Commands dropped because the ring buffer was full.
+    dropped: AtomicUsize,
+    /// Last time a drop warning was printed (rate limit).
+    last_drop_log: Mutex<Option<Instant>>,
 }
+
+/// How many times to retry a must-not-drop command when the ring is full.
+/// The audio callback drains the ring every period (≈1-10 ms), so a few
+/// short sleeps are enough unless the audio thread has stalled.
+const PUSH_RETRIES: u32 = 5;
+const PUSH_RETRY_DELAY: Duration = Duration::from_millis(1);
 
 impl CommandSink {
     pub fn new(tx: Arc<Mutex<ringbuf::HeapProd<SynthCommand>>>, patches: Vec<DxVoice>) -> Self {
-        Self { tx, patches }
+        Self {
+            tx,
+            patches,
+            dropped: AtomicUsize::new(0),
+            last_drop_log: Mutex::new(None),
+        }
     }
 
     /// Push a raw synth command to the audio thread.
+    ///
+    /// Losing a NoteOn/CC/bend under overload is a glitch; losing a NoteOff
+    /// or LoadPatch leaves a note hanging or the wrong patch loaded, so
+    /// those are retried briefly before being counted as dropped.
     pub fn send(&self, cmd: SynthCommand) {
-        if let Ok(mut tx) = self.tx.lock() {
-            let _ = tx.try_push(cmd);
+        let critical = matches!(cmd, SynthCommand::NoteOff { .. } | SynthCommand::LoadPatch(_));
+        let mut cmd = cmd;
+        let mut attempts = 0;
+        loop {
+            let Ok(mut tx) = self.tx.lock() else { return };
+            match tx.try_push(cmd) {
+                Ok(()) => return,
+                Err(rejected) => {
+                    drop(tx);
+                    cmd = rejected;
+                    if !critical || attempts >= PUSH_RETRIES {
+                        self.record_drop(&cmd);
+                        return;
+                    }
+                    attempts += 1;
+                    std::thread::sleep(PUSH_RETRY_DELAY);
+                }
+            }
+        }
+    }
+
+    fn record_drop(&self, cmd: &SynthCommand) {
+        let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut last = self.last_drop_log.lock().unwrap_or_else(|e| e.into_inner());
+        let due = match *last {
+            Some(t) => t.elapsed() >= Duration::from_secs(1),
+            None => true,
+        };
+        if due {
+            *last = Some(Instant::now());
+            eprint!(
+                "\r\x1b[K  Warning: synth command queue full, dropped {:?} ({} dropped so far)\r\n",
+                cmd, total
+            );
         }
     }
 
