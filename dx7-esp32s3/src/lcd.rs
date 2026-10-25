@@ -14,6 +14,7 @@ use embedded_graphics::{
     mono_font::{ascii::FONT_10X20, MonoTextStyleBuilder},
     pixelcolor::Rgb565,
     prelude::*,
+    primitives::Rectangle,
     text::{Alignment, Text},
 };
 
@@ -136,12 +137,27 @@ pub fn poll_touch() -> Option<Swipe> {
     }
 }
 
-/// Draw patch name centered on display.
+/// Vertical band that `draw_patch` owns. FONT_10X20 glyphs drawn with their
+/// alphabetic baseline at y=120 span roughly y=105..=125, so a 40px band
+/// centred on the baseline covers them with margin. Clearing only this band
+/// (240x40 px = 19 KB over SPI) instead of the full 240x240 (115 KB) keeps a
+/// redraw well under 10 ms at 40 MHz.
+const TEXT_BAND_TOP: i32 = 100;
+const TEXT_BAND_HEIGHT: u32 = 40;
+
+/// Draw patch name centered on display (blocking SPI).
+///
+/// Must not be called from the audio loop in the async builds; use
+/// [`request_draw`] from there and let [`ui_task`] do the SPI work.
 pub fn draw_patch(program: u8, name: &str) {
     let display = unsafe { DISPLAY.as_mut().unwrap() };
 
-    use embedded_graphics::prelude::DrawTarget as _;
-    DrawTarget::clear(display, Rgb565::BLACK).unwrap();
+    display
+        .fill_solid(
+            &Rectangle::new(Point::new(0, TEXT_BAND_TOP), Size::new(240, TEXT_BAND_HEIGHT)),
+            Rgb565::BLACK,
+        )
+        .unwrap();
 
     let mut buf = [0u8; 16];
     let len = format_patch_line(program + 1, name.trim(), &mut buf);
@@ -156,6 +172,90 @@ pub fn draw_patch(program: u8, name: &str) {
     Text::with_alignment(line, Point::new(120, 120), style, Alignment::Center)
         .draw(display)
         .unwrap();
+}
+
+// --- Async UI task (embassy builds only) ---
+//
+// The audio loop must never block on SPI/I2C: a full redraw is >20 ms and a
+// touch poll is ~0.2 ms, while the I2S DMA ring only holds ~5 ms. In the
+// async builds all display/touch I/O happens in `ui_task`, and the audio loop
+// talks to it through lock-free embassy-sync primitives:
+//   audio -> ui : `PATCH_SIGNAL` (latest patch wins; a redraw is idempotent)
+//   ui -> audio : `SWIPE_CHANNEL` (bounded queue of gestures)
+
+/// Patch shown on the display. `name` is the raw 10-byte DX7 voice name.
+#[cfg(any(feature = "ble-midi", feature = "usb-midi"))]
+#[derive(Clone, Copy)]
+pub struct PatchInfo {
+    pub program: u8,
+    pub name: [u8; 10],
+}
+
+#[cfg(any(feature = "ble-midi", feature = "usb-midi"))]
+impl PatchInfo {
+    pub fn new(program: u8, name: &str) -> Self {
+        let mut buf = [b' '; 10];
+        let bytes = name.as_bytes();
+        let n = bytes.len().min(10);
+        buf[..n].copy_from_slice(&bytes[..n]);
+        Self { program, name: buf }
+    }
+
+    pub fn name_str(&self) -> &str {
+        core::str::from_utf8(&self.name).unwrap_or("??????????")
+    }
+}
+
+/// Latest patch to display; written by the audio loop, consumed by `ui_task`.
+#[cfg(any(feature = "ble-midi", feature = "usb-midi"))]
+pub static PATCH_SIGNAL: embassy_sync::signal::Signal<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    PatchInfo,
+> = embassy_sync::signal::Signal::new();
+
+/// Swipe gestures detected by `ui_task`; drained by the audio loop.
+#[cfg(any(feature = "ble-midi", feature = "usb-midi"))]
+pub static SWIPE_CHANNEL: embassy_sync::channel::Channel<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    Swipe,
+    4,
+> = embassy_sync::channel::Channel::new();
+
+/// Touch poll interval. CST816 gesture reports persist for well over 50 ms,
+/// so polling at 20 Hz is plenty and keeps I2C traffic negligible.
+#[cfg(any(feature = "ble-midi", feature = "usb-midi"))]
+const TOUCH_POLL_MS: u64 = 50;
+
+/// Ask `ui_task` to show `program`/`name`. Non-blocking; safe from the audio
+/// loop. Coalesces: if several requests arrive before the redraw, only the
+/// last one is drawn.
+#[cfg(any(feature = "ble-midi", feature = "usb-midi"))]
+pub fn request_draw(program: u8, name: &str) {
+    PATCH_SIGNAL.signal(PatchInfo::new(program, name));
+}
+
+/// Display + touch task. Owns all blocking LCD SPI and touch I2C traffic.
+#[cfg(any(feature = "ble-midi", feature = "usb-midi"))]
+#[embassy_executor::task]
+pub async fn ui_task() {
+    use embassy_futures::select::{select, Either};
+
+    loop {
+        match select(
+            PATCH_SIGNAL.wait(),
+            embassy_time::Timer::after_millis(TOUCH_POLL_MS),
+        )
+        .await
+        {
+            Either::First(info) => draw_patch(info.program, info.name_str()),
+            Either::Second(()) => {
+                if let Some(swipe) = poll_touch() {
+                    // Drop the gesture if the audio loop is behind by 4 swipes.
+                    let _ = SWIPE_CHANNEL.try_send(swipe);
+                }
+            }
+        }
+    }
 }
 
 /// Format "N:NAME" into buf, return length.

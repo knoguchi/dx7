@@ -170,6 +170,29 @@ mod mc_render {
     }
 }
 
+// --- I2S DMA underrun accounting ---
+
+/// Number of I2S circular-DMA underruns since boot (for diagnostics).
+#[cfg(all(any(feature = "ble-midi", feature = "usb-midi"), feature = "es8311"))]
+static AUDIO_UNDERRUNS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Handle a circular-DMA underrun. esp-hal reports one as `DmaError::Late`
+/// from `available()`/`push()` once every descriptor is CPU-owned, i.e. the
+/// DMA has played everything we pushed and is now replaying stale data. The
+/// failed transaction keeps returning `Late`, so the caller must stop it (done
+/// here) and start a fresh `write_dma_circular`.
+#[cfg(all(any(feature = "ble-midi", feature = "usb-midi"), feature = "es8311"))]
+fn audio_underrun(
+    failed: esp_hal::dma::DmaTransferTxCircular<
+        '_,
+        esp_hal::i2s::master::I2sTx<'static, esp_hal::Blocking>,
+    >,
+) {
+    let n = AUDIO_UNDERRUNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    let _ = failed.stop();
+    println!("audio: I2S DMA underrun #{}", n);
+}
+
 // --- Voice dispatch (ported from RP2350) ---
 
 #[cfg(any(feature = "ble-midi", feature = "usb-midi"))]
@@ -271,7 +294,7 @@ fn dispatch_midi(
         dx7_midi::MidiMessage::ProgramChange { program, .. } => {
             if let Some(p) = load_rom1a_voice(program as usize) {
                 #[cfg(feature = "lcd")]
-                lcd::draw_patch(program, p.name_str());
+                lcd::request_draw(program, p.name_str());
                 channels[0].patch = p;
             }
         }
@@ -299,11 +322,13 @@ async fn main(_spawner: embassy_executor::Spawner) {
     let timg0 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0);
 
-    // Initialize LCD display
+    // Initialize LCD display; all later LCD/touch I/O runs in lcd::ui_task,
+    // never in the audio loop (blocking SPI there underruns the I2S DMA).
     #[cfg(feature = "lcd")]
     {
         lcd::init();
         lcd::draw_patch(0, load_rom1a_voice(0).unwrap().name_str());
+        _spawner.must_spawn(lcd::ui_task());
         println!("LCD initialized");
     }
 
@@ -367,13 +392,11 @@ async fn ble_midi_synth(bluetooth: esp_hal::peripherals::BT<'static>) -> ! {
     #[cfg(feature = "es8311")]
     let (mut i2s_tx, _pa) = setup_i2s_es8311();
 
-    // Start circular DMA — gapless audio output
-    // DMA buffer: 4 blocks worth of stereo i16 samples
+    // Circular DMA buffer: 4 blocks worth of stereo i16 samples (~5.3 ms).
+    // The transfer itself is started inside audio_task so it can be restarted
+    // after an underrun.
     #[cfg(feature = "es8311")]
     static mut DMA_BUF: [u8; N * 2 * 2 * 4] = [0u8; N * 2 * 2 * 4];
-    #[cfg(feature = "es8311")]
-    #[allow(static_mut_refs)]
-    let mut dma_transfer = i2s_tx.write_dma_circular(unsafe { &mut DMA_BUF }).unwrap();
 
     // Voice pool (shared with core 1 via statics)
     #[allow(static_mut_refs)]
@@ -461,14 +484,18 @@ async fn ble_midi_synth(bluetooth: esp_hal::peripherals::BT<'static>) -> ! {
 
     let audio_task = async {
         let mut output = [0i32; N];
+        // Start circular DMA — gapless audio output
+        #[cfg(feature = "es8311")]
+        #[allow(static_mut_refs)]
+        let mut dma_transfer = i2s_tx.write_dma_circular(unsafe { &mut DMA_BUF }).unwrap();
         #[cfg(feature = "lcd")]
         let mut current_program: u8 = 0;
         #[cfg(feature = "lcd")]
         let mut chord_off_countdown: u32 = 0;
         loop {
-            // Poll touch panel for patch switching
+            // Touch gestures arrive from lcd::ui_task; no I2C/SPI on this path.
             #[cfg(feature = "lcd")]
-            if let Some(swipe) = lcd::poll_touch() {
+            if let Ok(swipe) = lcd::SWIPE_CHANNEL.try_receive() {
                 match swipe {
                     lcd::Swipe::Up | lcd::Swipe::Down => {
                         let new_prog = match swipe {
@@ -476,7 +503,7 @@ async fn ble_midi_synth(bluetooth: esp_hal::peripherals::BT<'static>) -> ! {
                             _ => if current_program > 0 { current_program - 1 } else { 31 },
                         };
                         if let Some(p) = load_rom1a_voice(new_prog as usize) {
-                            lcd::draw_patch(new_prog, p.name_str());
+                            lcd::request_draw(new_prog, p.name_str());
                             channels[0].patch = p;
                             current_program = new_prog;
                         }
@@ -570,12 +597,29 @@ async fn ble_midi_synth(bluetooth: esp_hal::peripherals::BT<'static>) -> ! {
                 };
                 let mut sent = 0;
                 while sent < bytes.len() {
-                    let avail = dma_transfer.available().unwrap();
-                    if avail > 0 {
-                        let chunk = usize::min(avail, bytes.len() - sent);
-                        sent += dma_transfer.push(&bytes[sent..sent + chunk]).unwrap();
-                    } else {
-                        embassy_futures::yield_now().await;
+                    let pushed = match dma_transfer.available() {
+                        Ok(0) => {
+                            embassy_futures::yield_now().await;
+                            continue;
+                        }
+                        Ok(avail) => {
+                            let chunk = usize::min(avail, bytes.len() - sent);
+                            dma_transfer.push(&bytes[sent..sent + chunk])
+                        }
+                        Err(e) => Err(e),
+                    };
+                    match pushed {
+                        Ok(n) => sent += n,
+                        Err(_) => {
+                            // Underrun (DmaError::Late): the ring drained before we
+                            // refilled it and the transaction is now stuck. Count it,
+                            // restart DMA, and drop the rest of this block.
+                            audio_underrun(dma_transfer);
+                            #[allow(static_mut_refs)]
+                            let dma_buf = unsafe { &mut DMA_BUF };
+                            dma_transfer = i2s_tx.write_dma_circular(dma_buf).unwrap();
+                            break;
+                        }
                     }
                 }
             }
@@ -678,11 +722,9 @@ async fn usb_midi_synth() -> ! {
     #[cfg(feature = "es8311")]
     let (mut i2s_tx, _pa) = setup_i2s_es8311();
 
+    // Circular DMA buffer (see ble_midi_synth); transfer is started in audio_task.
     #[cfg(feature = "es8311")]
     static mut DMA_BUF: [u8; N * 2 * 2 * 4] = [0u8; N * 2 * 2 * 4];
-    #[cfg(feature = "es8311")]
-    #[allow(static_mut_refs)]
-    let mut dma_transfer = i2s_tx.write_dma_circular(unsafe { &mut DMA_BUF }).unwrap();
 
     // Voice pool
     #[allow(static_mut_refs)]
@@ -736,6 +778,9 @@ async fn usb_midi_synth() -> ! {
     // Audio render task (same as BLE MIDI version)
     let audio_task = async {
         let mut output = [0i32; N];
+        #[cfg(feature = "es8311")]
+        #[allow(static_mut_refs)]
+        let mut dma_transfer = i2s_tx.write_dma_circular(unsafe { &mut DMA_BUF }).unwrap();
         loop {
             while let Some(msg) = MIDI_QUEUE.pop() {
                 dispatch_midi(msg, voices, voice_ages, voice_age, &mut channels);
@@ -781,12 +826,27 @@ async fn usb_midi_synth() -> ! {
                 };
                 let mut sent = 0;
                 while sent < bytes.len() {
-                    let avail = dma_transfer.available().unwrap();
-                    if avail > 0 {
-                        let chunk = usize::min(avail, bytes.len() - sent);
-                        sent += dma_transfer.push(&bytes[sent..sent + chunk]).unwrap();
-                    } else {
-                        embassy_futures::yield_now().await;
+                    let pushed = match dma_transfer.available() {
+                        Ok(0) => {
+                            embassy_futures::yield_now().await;
+                            continue;
+                        }
+                        Ok(avail) => {
+                            let chunk = usize::min(avail, bytes.len() - sent);
+                            dma_transfer.push(&bytes[sent..sent + chunk])
+                        }
+                        Err(e) => Err(e),
+                    };
+                    match pushed {
+                        Ok(n) => sent += n,
+                        Err(_) => {
+                            // Underrun: see ble_midi_synth.
+                            audio_underrun(dma_transfer);
+                            #[allow(static_mut_refs)]
+                            let dma_buf = unsafe { &mut DMA_BUF };
+                            dma_transfer = i2s_tx.write_dma_circular(dma_buf).unwrap();
+                            break;
+                        }
                     }
                 }
             }
