@@ -347,15 +347,108 @@ mod mc_render {
     use dx7_core::tables::N;
     use super::MAX_VOICES;
 
-    /// Shared voice pool. Core 0 handles all note_on/note_off (when core 1 is idle).
-    /// During render: core 0 renders voices 0..2, core 1 renders voices 3..5.
-    pub static mut VOICES: core::mem::MaybeUninit<[Voice; MAX_VOICES]> =
-        core::mem::MaybeUninit::uninit();
-    pub static mut VOICE_AGES: [u32; MAX_VOICES] = [0; MAX_VOICES];
-    pub static mut VOICE_AGE: u32 = 0;
+    /// Interior-mutable static shared between the two cores without a lock.
+    ///
+    /// The type only supplies the `UnsafeCell` that makes writes through a
+    /// shared reference legal; exclusivity comes from the RENDER_START /
+    /// RENDER_DONE handshake documented on [`VoicePool`].
+    #[repr(transparent)]
+    pub struct RacyCell<T>(core::cell::UnsafeCell<T>);
 
-    /// Core 1 render output buffer (written by core 1, read by core 0 after RENDER_DONE).
-    pub static mut CORE1_BUF: [i32; N] = [0i32; N];
+    // SAFETY: access is serialised by the RENDER_START/RENDER_DONE protocol;
+    // see VoicePool. T: Send so moving the value's ownership between cores
+    // (which is what the handshake does) is permitted.
+    unsafe impl<T: Send> Sync for RacyCell<T> {}
+
+    impl<T> RacyCell<T> {
+        pub const fn new(v: T) -> Self {
+            Self(core::cell::UnsafeCell::new(v))
+        }
+
+        /// Raw pointer to the contents.
+        ///
+        /// # Safety
+        /// Dereferencing is only sound while no other reference derived from
+        /// this cell is live on either core.
+        pub const fn get(&self) -> *mut T {
+            self.0.get()
+        }
+    }
+
+    /// Shared voice pool, one `UnsafeCell` per slot so the two cores never
+    /// hold overlapping `&mut` into one array.
+    ///
+    /// Access protocol (the only thing that makes `get`/`all` sound):
+    ///
+    /// * Core 0 raises RENDER_START (Release) after clearing RENDER_DONE; core 1
+    ///   spins on RENDER_START (Acquire), renders slots `MAX_VOICES/2..`, then
+    ///   stores RENDER_DONE (Release). Core 0 waits on RENDER_DONE (Acquire).
+    /// * **Render phase** (RENDER_START raised, RENDER_DONE not yet observed):
+    ///   core 0 touches only slots `0..MAX_VOICES/2`, core 1 only
+    ///   `MAX_VOICES/2..MAX_VOICES`. Each core takes one slot at a time via
+    ///   [`VoicePool::get`] and drops that reference before taking the next.
+    /// * **Dispatch phase** (core 0 has observed RENDER_DONE and has not yet
+    ///   raised RENDER_START): core 1 holds no reference into the pool, so
+    ///   core 0 may borrow the whole array via [`VoicePool::all`] for MIDI
+    ///   dispatch. That borrow must end before RENDER_START is raised.
+    /// * Core 1 never calls `all`. Nothing outside the audio tasks touches
+    ///   the pool.
+    ///
+    /// RENDER_DONE starts `true`, so the first iteration is a dispatch phase.
+    pub struct VoicePool {
+        slots: [RacyCell<core::mem::MaybeUninit<Voice>>; MAX_VOICES],
+    }
+
+    impl VoicePool {
+        const fn new() -> Self {
+            Self {
+                slots: [const { RacyCell::new(core::mem::MaybeUninit::uninit()) }; MAX_VOICES],
+            }
+        }
+
+        /// Initialise every slot with `Voice::new()`.
+        ///
+        /// # Safety
+        /// Call exactly once, on core 0, before core 1 is started and before
+        /// any `get`/`all`.
+        pub unsafe fn init(&self) {
+            for slot in &self.slots {
+                (*slot.get()).write(Voice::new());
+            }
+        }
+
+        /// Exclusive access to one slot.
+        ///
+        /// # Safety
+        /// `init` must have run; `idx < MAX_VOICES`; the caller must own
+        /// `idx` under the access protocol above, and no other reference to
+        /// this slot (from `get` or `all`) may be live.
+        #[inline(always)]
+        pub unsafe fn get(&self, idx: usize) -> &mut Voice {
+            (*self.slots[idx].get()).assume_init_mut()
+        }
+
+        /// Exclusive access to the whole pool, for MIDI dispatch on core 0.
+        ///
+        /// # Safety
+        /// `init` must have run and the caller must be core 0 in the dispatch
+        /// phase (RENDER_DONE observed true, RENDER_START not raised). The
+        /// returned borrow must end before RENDER_START is raised again.
+        #[inline(always)]
+        pub unsafe fn all(&self) -> &mut [Voice; MAX_VOICES] {
+            // RacyCell<T>, UnsafeCell<T> and MaybeUninit<T> are all
+            // repr(transparent), so the slot array has the layout of
+            // [Voice; MAX_VOICES].
+            &mut *(self.slots.as_ptr() as *mut [Voice; MAX_VOICES])
+        }
+    }
+
+    pub static VOICES: VoicePool = VoicePool::new();
+
+    /// Core 1 render output. Written by core 1 during the render phase, read
+    /// by core 0 only after it has observed RENDER_DONE — same protocol as
+    /// [`VoicePool`].
+    pub static CORE1_BUF: RacyCell<[i32; N]> = RacyCell::new([0i32; N]);
 
     /// Core 0 sets RENDER_START=true to signal core 1 to begin rendering.
     pub static RENDER_START: AtomicBool = AtomicBool::new(false);
@@ -368,24 +461,30 @@ mod mc_render {
 
     /// Core 1 entry: render voices MAX_VOICES/2..MAX_VOICES on demand.
     /// DMA handles PWM output — core 1 only renders voices.
-    #[allow(static_mut_refs)]
+    ///
+    /// # Safety
+    /// Must only be run once, on core 1, after `VOICES.init()`.
     pub unsafe fn core1_entry() -> ! {
-        let voices = VOICES.assume_init_mut();
-
         loop {
             while !RENDER_START.load(Ordering::Acquire) {
                 cortex_m::asm::nop();
             }
             RENDER_START.store(false, Ordering::Relaxed);
 
-            // Render voices MAX_VOICES/2..MAX_VOICES into CORE1_BUF
-            CORE1_BUF.fill(0);
-            for idx in (MAX_VOICES / 2)..MAX_VOICES {
-                if !voices[idx].is_finished() {
-                    let mut buf = [0i32; N];
-                    voices[idx].render(&mut buf);
-                    for j in 0..N {
-                        CORE1_BUF[j] = super::qadd(CORE1_BUF[j], buf[j]);
+            // Render phase: this core owns slots MAX_VOICES/2.. and CORE1_BUF
+            // until it stores RENDER_DONE below. All references are scoped to
+            // this block so none outlive the handshake.
+            {
+                let out = &mut *CORE1_BUF.get();
+                out.fill(0);
+                for idx in (MAX_VOICES / 2)..MAX_VOICES {
+                    let v = VOICES.get(idx);
+                    if !v.is_finished() {
+                        let mut buf = [0i32; N];
+                        v.render(&mut buf);
+                        for j in 0..N {
+                            out[j] = super::qadd(out[j], buf[j]);
+                        }
                     }
                 }
             }
@@ -842,10 +941,9 @@ async fn usb_midi_pwm_synth(
     pwm_config.compare_b = 512;
     let _pwm = Pwm::new_output_b(pwm_slice, pwm_pin, pwm_config);
 
-    // Initialize shared voice pool
-    #[allow(static_mut_refs)]
+    // Initialize shared voice pool (before core 1 starts — see VoicePool::init)
     unsafe {
-        mc_render::VOICES.write(core::array::from_fn(|_| Voice::new()));
+        mc_render::VOICES.init();
     }
 
     // Start core 1 for parallel voice rendering (DMA handles PWM output)
@@ -1032,12 +1130,9 @@ async fn usb_midi_pwm_synth(
 
     // Task 3: Audio render loop (core 0 renders voices 0..2, core 1 renders 2..4)
     let audio_render = async {
-        #[allow(static_mut_refs)]
-        let voices = unsafe { mc_render::VOICES.assume_init_mut() };
-        #[allow(static_mut_refs)]
-        let voice_ages = unsafe { &mut mc_render::VOICE_AGES };
-        #[allow(static_mut_refs)]
-        let voice_age = unsafe { &mut mc_render::VOICE_AGE };
+        // Voice-age bookkeeping is only touched by core 0 during dispatch.
+        let mut voice_ages = [0u32; MAX_VOICES];
+        let mut voice_age: u32 = 0;
         let init_patch = load_rom1a_voice(0).unwrap();
         let mut channels: [ChannelState; NUM_CHANNELS] = core::array::from_fn(|_| ChannelState::new(init_patch.clone()));
         let mut output = [0i32; N];
@@ -1074,7 +1169,12 @@ async fn usb_midi_pwm_synth(
                 } else {
                     None
                 };
-                dispatch_midi(msg, voices, voice_ages, voice_age, &mut channels, sysex_bank,
+                // SAFETY: dispatch phase — RENDER_DONE was observed true at the end of
+                // the previous block (or is the initial `true`) and RENDER_START has not
+                // been raised yet, so core 1 holds no reference into the pool. The
+                // borrow ends with this statement, before RENDER_START below.
+                let voices = unsafe { mc_render::VOICES.all() };
+                dispatch_midi(msg, voices, &mut voice_ages, &mut voice_age, &mut channels, sysex_bank,
                     SYNTH_MODE.load(Ordering::Acquire));
             }
 
@@ -1087,9 +1187,12 @@ async fn usb_midi_pwm_synth(
             // Render voices 0..MAX_VOICES/2 on core 0
             output.fill(0);
             for idx in 0..(MAX_VOICES / 2) {
-                if !voices[idx].is_finished() {
+                // SAFETY: render phase — slots 0..MAX_VOICES/2 belong to core 0;
+                // core 1 only touches MAX_VOICES/2.. . One slot borrowed at a time.
+                let v = unsafe { mc_render::VOICES.get(idx) };
+                if !v.is_finished() {
                     let mut voice_buf = [0i32; N];
-                    voices[idx].render(&mut voice_buf);
+                    v.render(&mut voice_buf);
                     for i in 0..N {
                         output[i] = qadd(output[i], voice_buf[i]);
                     }
@@ -1102,9 +1205,12 @@ async fn usb_midi_pwm_synth(
             }
 
             // Combine core 1's rendered output
-            #[allow(static_mut_refs)]
+            // SAFETY: core 1 published CORE1_BUF with its RENDER_DONE store (Release),
+            // which the Acquire load above observed; it will not write again until
+            // the next RENDER_START.
+            let core1_out = unsafe { &*mc_render::CORE1_BUF.get() };
             for i in 0..N {
-                output[i] = qadd(output[i], unsafe { mc_render::CORE1_BUF[i] });
+                output[i] = qadd(output[i], core1_out[i]);
             }
 
             // Convert to f32, apply DC blocker + LPF, then scale to 10-bit PWM duty
@@ -1179,10 +1285,9 @@ async fn usb_ble_midi_pwm_synth(
     pwm_config.compare_b = 512;
     let _pwm = Pwm::new_output_b(pwm_slice, pwm_pin, pwm_config);
 
-    // Initialize shared voice pool
-    #[allow(static_mut_refs)]
+    // Initialize shared voice pool (before core 1 starts — see VoicePool::init)
     unsafe {
-        mc_render::VOICES.write(core::array::from_fn(|_| Voice::new()));
+        mc_render::VOICES.init();
     }
 
     // Start core 1 for parallel voice rendering
@@ -1488,12 +1593,9 @@ async fn usb_ble_midi_pwm_synth(
 
         // Audio render loop (shared MIDI_QUEUE fed by both USB and BLE)
         let audio_render = async {
-            #[allow(static_mut_refs)]
-            let voices = unsafe { mc_render::VOICES.assume_init_mut() };
-            #[allow(static_mut_refs)]
-            let voice_ages = unsafe { &mut mc_render::VOICE_AGES };
-            #[allow(static_mut_refs)]
-            let voice_age = unsafe { &mut mc_render::VOICE_AGE };
+            // Voice-age bookkeeping is only touched by core 0 during dispatch.
+            let mut voice_ages = [0u32; MAX_VOICES];
+            let mut voice_age: u32 = 0;
             let init_patch = load_rom1a_voice(0).unwrap();
             let mut channels: [ChannelState; NUM_CHANNELS] = core::array::from_fn(|_| ChannelState::new(init_patch.clone()));
             let mut output = [0i32; N];
@@ -1528,7 +1630,12 @@ async fn usb_ble_midi_pwm_synth(
                     } else {
                         None
                     };
-                    dispatch_midi(msg, voices, voice_ages, voice_age, &mut channels, sysex_bank,
+                    // SAFETY: dispatch phase — RENDER_DONE was observed true at the end of
+                    // the previous block (or is the initial `true`) and RENDER_START has not
+                    // been raised yet, so core 1 holds no reference into the pool. The
+                    // borrow ends with this statement, before RENDER_START below.
+                    let voices = unsafe { mc_render::VOICES.all() };
+                    dispatch_midi(msg, voices, &mut voice_ages, &mut voice_age, &mut channels, sysex_bank,
                         SYNTH_MODE.load(Ordering::Acquire));
                 }
 
@@ -1541,9 +1648,12 @@ async fn usb_ble_midi_pwm_synth(
                 // Render voices 0..MAX_VOICES/2 on core 0
                 output.fill(0);
                 for idx in 0..(MAX_VOICES / 2) {
-                    if !voices[idx].is_finished() {
+                    // SAFETY: render phase — slots 0..MAX_VOICES/2 belong to core 0;
+                    // core 1 only touches MAX_VOICES/2.. . One slot borrowed at a time.
+                    let v = unsafe { mc_render::VOICES.get(idx) };
+                    if !v.is_finished() {
                         let mut voice_buf = [0i32; N];
-                        voices[idx].render(&mut voice_buf);
+                        v.render(&mut voice_buf);
                         for i in 0..N {
                             output[i] = qadd(output[i], voice_buf[i]);
                         }
@@ -1554,9 +1664,12 @@ async fn usb_ble_midi_pwm_synth(
                     embassy_futures::yield_now().await;
                 }
 
-                #[allow(static_mut_refs)]
+                // SAFETY: core 1 published CORE1_BUF with its RENDER_DONE store (Release),
+                // which the Acquire load above observed; it will not write again until
+                // the next RENDER_START.
+                let core1_out = unsafe { &*mc_render::CORE1_BUF.get() };
                 for i in 0..N {
-                    output[i] = qadd(output[i], unsafe { mc_render::CORE1_BUF[i] });
+                    output[i] = qadd(output[i], core1_out[i]);
                 }
 
                 for i in 0..N {
@@ -1631,10 +1744,9 @@ async fn ble_midi_pwm_synth(
     pwm_config.compare_b = 512;
     let _pwm = Pwm::new_output_b(pwm_slice, pwm_pin, pwm_config);
 
-    // Initialize shared voice pool
-    #[allow(static_mut_refs)]
+    // Initialize shared voice pool (before core 1 starts — see VoicePool::init)
     unsafe {
-        mc_render::VOICES.write(core::array::from_fn(|_| Voice::new()));
+        mc_render::VOICES.init();
     }
 
     // Start core 1 for parallel voice rendering
@@ -1782,12 +1894,9 @@ async fn ble_midi_pwm_synth(
 
         // Audio render loop
         let audio_render = async {
-        #[allow(static_mut_refs)]
-        let voices = unsafe { mc_render::VOICES.assume_init_mut() };
-        #[allow(static_mut_refs)]
-        let voice_ages = unsafe { &mut mc_render::VOICE_AGES };
-        #[allow(static_mut_refs)]
-        let voice_age = unsafe { &mut mc_render::VOICE_AGE };
+        // Voice-age bookkeeping is only touched by core 0 during dispatch.
+        let mut voice_ages = [0u32; MAX_VOICES];
+        let mut voice_age: u32 = 0;
         let init_patch = load_rom1a_voice(0).unwrap();
         let mut channels: [ChannelState; NUM_CHANNELS] = core::array::from_fn(|_| ChannelState::new(init_patch.clone()));
         let mut output = [0i32; N];
@@ -1816,7 +1925,12 @@ async fn ble_midi_pwm_synth(
         loop {
             // Drain MIDI queue
             while let Some(msg) = MIDI_QUEUE.pop() {
-                dispatch_midi(msg, voices, voice_ages, voice_age, &mut channels, None,
+                // SAFETY: dispatch phase — RENDER_DONE was observed true at the end of
+                // the previous block (or is the initial `true`) and RENDER_START has not
+                // been raised yet, so core 1 holds no reference into the pool. The
+                // borrow ends with this statement, before RENDER_START below.
+                let voices = unsafe { mc_render::VOICES.all() };
+                dispatch_midi(msg, voices, &mut voice_ages, &mut voice_age, &mut channels, None,
                     SYNTH_MODE.load(Ordering::Acquire));
             }
 
@@ -1829,9 +1943,12 @@ async fn ble_midi_pwm_synth(
             // Render voices 0..MAX_VOICES/2 on core 0
             output.fill(0);
             for idx in 0..(MAX_VOICES / 2) {
-                if !voices[idx].is_finished() {
+                // SAFETY: render phase — slots 0..MAX_VOICES/2 belong to core 0;
+                // core 1 only touches MAX_VOICES/2.. . One slot borrowed at a time.
+                let v = unsafe { mc_render::VOICES.get(idx) };
+                if !v.is_finished() {
                     let mut voice_buf = [0i32; N];
-                    voices[idx].render(&mut voice_buf);
+                    v.render(&mut voice_buf);
                     for i in 0..N {
                         output[i] = qadd(output[i], voice_buf[i]);
                     }
@@ -1844,9 +1961,12 @@ async fn ble_midi_pwm_synth(
             }
 
             // Combine core 1 output
-            #[allow(static_mut_refs)]
+            // SAFETY: core 1 published CORE1_BUF with its RENDER_DONE store (Release),
+            // which the Acquire load above observed; it will not write again until
+            // the next RENDER_START.
+            let core1_out = unsafe { &*mc_render::CORE1_BUF.get() };
             for i in 0..N {
-                output[i] = qadd(output[i], unsafe { mc_render::CORE1_BUF[i] });
+                output[i] = qadd(output[i], core1_out[i]);
             }
 
             // Convert to f32, filter, soft-clip, scale to 10-bit PWM duty
