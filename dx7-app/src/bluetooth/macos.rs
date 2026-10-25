@@ -1,13 +1,12 @@
 //! BLE MIDI peripheral using CoreBluetooth (macOS).
 
 use super::parse_ble_midi_packet;
-use dx7_core::SynthCommand;
+use crate::midi::CommandSink;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, ProtocolObject};
 use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass};
 use objc2_core_bluetooth::*;
 use objc2_foundation::*;
-use ringbuf::traits::Producer;
 use std::sync::{Arc, Mutex};
 
 /// BLE MIDI Service UUID (standard BLE MIDI spec).
@@ -17,7 +16,7 @@ const MIDI_SERVICE_UUID_STR: &str = "03B80E5A-EDE8-4B33-A751-6CE34EC4C700";
 const MIDI_CHAR_UUID_STR: &str = "7772E5DB-3868-4112-A1A9-F2669D106BF3";
 
 struct DelegateIvars {
-    command_tx: Arc<Mutex<ringbuf::HeapProd<SynthCommand>>>,
+    sink: Arc<CommandSink>,
     ready_tx: Mutex<Option<std::sync::mpsc::Sender<Result<(), String>>>>,
 }
 
@@ -139,12 +138,7 @@ define_class!(
                 if let Some(data) = unsafe { request.value() } {
                     let bytes = data.to_vec();
                     eprintln!("BLE MIDI: recv {} bytes: {:02X?}", bytes.len(), bytes);
-                    let commands = parse_ble_midi_packet(&bytes);
-                    if let Ok(mut tx) = self.ivars().command_tx.lock() {
-                        for cmd in commands {
-                            let _ = tx.try_push(cmd);
-                        }
-                    }
+                    self.ivars().sink.dispatch_all(parse_ble_midi_packet(&bytes));
                 }
                 // Respond to the first request to acknowledge all writes
                 if !responded {
@@ -208,9 +202,7 @@ pub struct BleHandler {
 
 impl BleHandler {
     /// Start the BLE MIDI peripheral in a background thread.
-    pub fn start(
-        command_tx: Arc<Mutex<ringbuf::HeapProd<SynthCommand>>>,
-    ) -> Result<Self, String> {
+    pub fn start(sink: Arc<CommandSink>) -> Result<Self, String> {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
 
@@ -218,7 +210,7 @@ impl BleHandler {
             .name("ble-midi".into())
             .spawn(move || {
                 let delegate = MidiPeripheralDelegate::new(DelegateIvars {
-                    command_tx,
+                    sink,
                     ready_tx: Mutex::new(Some(ready_tx)),
                 });
 

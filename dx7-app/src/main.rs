@@ -17,8 +17,9 @@ mod rtpmidi;
 
 use clap::Parser;
 use dx7_core::{get_rom1a_preset, DxVoice, SynthCommand};
-use std::time::Duration;
 use std::io::Write;
+use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(name = "dx7", about = "DX7 FM Synthesizer Emulator")]
@@ -79,7 +80,7 @@ struct Args {
     dry: bool,
 
     /// Enable General MIDI sound set (maps program changes to DX7 patches).
-    /// Requires sysex/ directory with factory, vrc, and greymatter banks.
+    /// Uses the compiled-in GM ROM; no sysex files are needed.
     #[arg(long)]
     gm: bool,
 
@@ -116,9 +117,9 @@ fn main() {
         return;
     }
 
-    // Load patches
+    // Load patches (never empty: falls back to the ROM1A presets)
     let patches = load_patches(&args);
-    let patch_idx = args.patch.min(patches.len() - 1);
+    let patch_idx = args.patch.min(patches.len().saturating_sub(1));
     let initial_patch = patches[patch_idx].clone();
 
     println!("DX7 FM Synthesizer");
@@ -146,6 +147,9 @@ fn load_patches(args: &Args) -> Vec<DxVoice> {
     if let Some(ref syx_path) = args.sysex {
         match std::fs::read(syx_path) {
             Ok(data) => match DxVoice::parse_bulk_dump(&data) {
+                Ok(voices) if voices.is_empty() => {
+                    eprintln!("SysEx file {} contains no voices; using ROM1A presets", syx_path);
+                }
                 Ok(voices) => {
                     println!("Loaded {} patches from {}", voices.len(), syx_path);
                     for (i, v) in voices.iter().enumerate() {
@@ -642,7 +646,7 @@ fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches
 
     // Load GM sound set if --gm flag is set
     let gm_set = if args.gm {
-        let gm = gm::GmSoundSet::load("sysex");
+        let gm = gm::GmSoundSet::load();
         println!("GM: loaded 128-program sound set");
         // Set initial patch on all non-mapped channels to GM program 0 (Acoustic Grand Piano)
         for (ch, synth) in synths.iter_mut().enumerate() {
@@ -935,6 +939,17 @@ fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches
 }
 
 fn run_interactive(initial_patch: DxVoice, patches: Vec<DxVoice>, args: &Args) {
+    // Flags that only affect MIDI-file rendering are silently useless here.
+    if args.gm {
+        eprintln!("Warning: --gm only applies to --midi-file rendering; ignored in interactive mode");
+    }
+    if !args.channel_map.is_empty() {
+        eprintln!("Warning: --ch only applies to --midi-file rendering; ignored in interactive mode");
+    }
+    if args.track.is_some() {
+        eprintln!("Warning: --track only applies to --midi-file rendering; ignored in interactive mode");
+    }
+
     let engine = match audio::AudioEngine::start(initial_patch) {
         Ok(e) => e,
         Err(err) => {
@@ -945,12 +960,12 @@ fn run_interactive(initial_patch: DxVoice, patches: Vec<DxVoice>, args: &Args) {
 
     println!("Audio: {} Hz", engine.sample_rate);
 
+    // Shared dispatch path for every live input (MIDI, BLE, RTP, keyboard).
+    // Program Change messages select from `patches`, like the 1-0 keys.
+    let sink = Arc::new(midi::CommandSink::new(engine.command_sender(), patches));
 
     // Try to connect MIDI using the shared command channel
-    let midi_handler = match midi::MidiHandler::connect(
-        args.midi_port.as_deref(),
-        engine.command_sender(),
-    ) {
+    let midi_handler = match midi::MidiHandler::connect(args.midi_port.as_deref(), Arc::clone(&sink)) {
         Ok(h) => {
             println!("MIDI: {}", h.port_name);
             Some(h)
@@ -964,7 +979,7 @@ fn run_interactive(initial_patch: DxVoice, patches: Vec<DxVoice>, args: &Args) {
 
     #[cfg(feature = "bluetooth")]
     let _ble_handler = if args.bluetooth {
-        match bluetooth::BleHandler::start(engine.command_sender()) {
+        match bluetooth::BleHandler::start(Arc::clone(&sink)) {
             Ok(h) => {
                 println!("BLE MIDI: Advertising as \"DX7\"");
                 Some(h)
@@ -980,7 +995,7 @@ fn run_interactive(initial_patch: DxVoice, patches: Vec<DxVoice>, args: &Args) {
 
     #[cfg(feature = "rtp-midi")]
     let _rtp_handler = if args.rtp_midi {
-        match rtpmidi::RtpMidiHandler::start(Some(args.rtp_midi_port), engine.command_sender()) {
+        match rtpmidi::RtpMidiHandler::start(Some(args.rtp_midi_port), Arc::clone(&sink)) {
             Ok(h) => {
                 println!(
                     "RTP-MIDI: Listening on port {} (mDNS: \"DX7\")",
@@ -1031,25 +1046,22 @@ fn run_interactive(initial_patch: DxVoice, patches: Vec<DxVoice>, args: &Args) {
         for event in &events {
             match event {
                 keyboard::KeyboardEvent::NoteOn(note, vel) => {
-                    engine.send_command(SynthCommand::NoteOn {
+                    sink.send(SynthCommand::NoteOn {
                         note: *note,
                         velocity: *vel,
                     });
                 }
                 keyboard::KeyboardEvent::NoteOff(note) => {
-                    engine.send_command(SynthCommand::NoteOff { note: *note });
+                    sink.send(SynthCommand::NoteOff { note: *note });
                 }
                 keyboard::KeyboardEvent::OctaveChange(oct) => {
                     print!("\r\x1b[K  Octave: {:+}\r", oct);
                 }
                 keyboard::KeyboardEvent::PatchChange(idx) => {
                     let idx = *idx as usize;
-                    if idx < patches.len() {
-                        let patch = patches[idx].clone();
-                        let name = patch.name_str().to_string();
-                        engine.send_command(SynthCommand::LoadPatch(Box::new(patch)));
+                    if let Some(name) = sink.select_patch(idx) {
                         print!("\r\x1b[K  Patch {}: {}\r", idx, name);
-                        std::io::stdout().flush().unwrap();
+                        let _ = std::io::stdout().flush();
                     }
                 }
                 keyboard::KeyboardEvent::Quit => {

@@ -8,10 +8,9 @@ use bluer::{
         CharacteristicWrite, CharacteristicWriteMethod, Service,
     },
 };
-use dx7_core::SynthCommand;
+use crate::midi::CommandSink;
 use futures::StreamExt;
-use ringbuf::traits::Producer;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::oneshot;
 
 /// BLE MIDI Service UUID (standard BLE MIDI spec).
@@ -31,9 +30,7 @@ pub struct BleHandler {
 
 impl BleHandler {
     /// Start the BLE MIDI peripheral in a background thread.
-    pub fn start(
-        command_tx: Arc<Mutex<ringbuf::HeapProd<SynthCommand>>>,
-    ) -> Result<Self, String> {
+    pub fn start(sink: Arc<CommandSink>) -> Result<Self, String> {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
@@ -52,7 +49,7 @@ impl BleHandler {
                 };
 
                 rt.block_on(async move {
-                    match ble_server_task(command_tx, shutdown_rx, &ready_tx).await {
+                    match ble_server_task(sink, shutdown_rx, &ready_tx).await {
                         Ok(()) => {}
                         Err(e) => {
                             // If ready_tx hasn't been consumed yet, send the error
@@ -78,7 +75,7 @@ impl BleHandler {
 
 /// Main async task: register GATT service, advertise, and handle connections.
 async fn ble_server_task(
-    command_tx: Arc<Mutex<ringbuf::HeapProd<SynthCommand>>>,
+    sink: Arc<CommandSink>,
     shutdown_rx: oneshot::Receiver<()>,
     ready_tx: &std::sync::mpsc::Sender<Result<(), String>>,
 ) -> Result<(), String> {
@@ -164,12 +161,7 @@ async fn ble_server_task(
                         continue;
                     }
                     Ok(n) => {
-                        let commands = parse_ble_midi_packet(&buf[..n]);
-                        if let Ok(mut tx) = command_tx.lock() {
-                            for cmd in commands {
-                                let _ = tx.try_push(cmd);
-                            }
-                        }
+                        sink.dispatch_all(parse_ble_midi_packet(&buf[..n]));
                     }
                     Err(_) => {
                         continue;

@@ -3,7 +3,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleRate, Stream, StreamConfig};
 use dx7_core::SynthCommand;
-use ringbuf::traits::{Consumer, Producer, Split};
+use ringbuf::traits::{Consumer, Split};
 use std::sync::{Arc, Mutex};
 
 /// Audio engine that owns the output stream.
@@ -126,13 +126,6 @@ impl AudioEngine {
             command_tx,
             sample_rate: synth_rate,
         })
-    }
-
-    /// Send a command to the synth on the audio thread.
-    pub fn send_command(&self, cmd: SynthCommand) {
-        if let Ok(mut tx) = self.command_tx.lock() {
-            let _ = tx.try_push(cmd);
-        }
     }
 
     /// Get a clone of the command producer for another thread (e.g., MIDI).

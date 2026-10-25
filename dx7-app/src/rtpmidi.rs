@@ -4,11 +4,9 @@
 //! sessions from macOS Network MIDI, iPads, rtpMIDI on Windows, etc.
 //! Parses RTP MIDI packets and feeds commands into the synth engine.
 
-use crate::midi;
-use dx7_core::SynthCommand;
-use ringbuf::traits::Producer;
+use crate::midi::{self, CommandSink, MidiMessage};
 use std::net::UdpSocket;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Default control port (data port = control + 1).
@@ -47,10 +45,7 @@ impl Drop for RtpMidiHandler {
 
 impl RtpMidiHandler {
     /// Start the RTP-MIDI listener on the given port (or 5004 by default).
-    pub fn start(
-        port: Option<u16>,
-        command_tx: Arc<Mutex<ringbuf::HeapProd<SynthCommand>>>,
-    ) -> Result<Self, String> {
+    pub fn start(port: Option<u16>, sink: Arc<CommandSink>) -> Result<Self, String> {
         let control_port = port.unwrap_or(DEFAULT_PORT);
         let data_port = control_port + 1;
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -79,7 +74,7 @@ impl RtpMidiHandler {
         let handle = std::thread::Builder::new()
             .name("rtp-midi".into())
             .spawn(move || {
-                run_listener(ctrl_sock, data_sock, command_tx, &shutdown2);
+                run_listener(ctrl_sock, data_sock, sink, &shutdown2);
             })
             .map_err(|e| format!("Failed to spawn RTP-MIDI thread: {e}"))?;
 
@@ -130,7 +125,7 @@ fn register_mdns(name: &str, port: u16) -> Option<std::process::Child> {
 fn run_listener(
     ctrl_sock: UdpSocket,
     data_sock: UdpSocket,
-    command_tx: Arc<Mutex<ringbuf::HeapProd<SynthCommand>>>,
+    sink: Arc<CommandSink>,
     shutdown: &std::sync::atomic::AtomicBool,
 ) {
     let mut ctrl_buf = [0u8; 512];
@@ -157,11 +152,7 @@ fn run_listener(
             } else if n >= 12 && (data_buf[0] >> 6) == 2 {
                 // RTP packet (version 2)
                 if let Some(commands) = parse_rtp_midi(&data_buf[..n]) {
-                    if let Ok(mut tx) = command_tx.lock() {
-                        for cmd in commands {
-                            let _ = tx.try_push(cmd);
-                        }
-                    }
+                    sink.dispatch_all(commands);
                 }
             }
         }
@@ -266,7 +257,7 @@ fn handle_sync(
 }
 
 /// Parse an RTP MIDI packet and extract MIDI commands.
-fn parse_rtp_midi(packet: &[u8]) -> Option<Vec<SynthCommand>> {
+fn parse_rtp_midi(packet: &[u8]) -> Option<Vec<MidiMessage>> {
     // RTP header: 12 bytes minimum
     if packet.len() < 13 {
         return None;
@@ -346,8 +337,8 @@ fn parse_rtp_midi(packet: &[u8]) -> Option<Vec<SynthCommand>> {
         }
         pos += data_len;
 
-        if let Some(cmd) = midi::parse_midi_message(&msg) {
-            commands.push(cmd);
+        if let Some(msg) = midi::parse_midi_message(&msg) {
+            commands.push(msg);
         }
     }
 
@@ -378,6 +369,17 @@ fn midi_data_length(status: u8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::midi::MidiMessageKind;
+    use dx7_core::SynthCommand;
+
+    fn synth_cmds(msgs: &[MidiMessage]) -> Vec<SynthCommand> {
+        msgs.iter()
+            .map(|m| match &m.kind {
+                MidiMessageKind::Synth(c) => c.clone(),
+                other => panic!("expected synth command, got {:?}", other),
+            })
+            .collect()
+    }
 
     #[test]
     fn test_parse_rtp_midi_note_on() {
@@ -391,7 +393,7 @@ mod tests {
         // + Note On C4 vel=100
         packet.extend_from_slice(&[0x03, 0x90, 60, 100]);
 
-        let cmds = parse_rtp_midi(&packet).unwrap();
+        let cmds = synth_cmds(&parse_rtp_midi(&packet).unwrap());
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             SynthCommand::NoteOn { note, velocity } => {
@@ -411,7 +413,7 @@ mod tests {
         ];
         packet.extend_from_slice(&[0x03, 0x80, 60, 0]);
 
-        let cmds = parse_rtp_midi(&packet).unwrap();
+        let cmds = synth_cmds(&parse_rtp_midi(&packet).unwrap());
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             SynthCommand::NoteOff { note } => assert_eq!(*note, 60),
@@ -440,7 +442,7 @@ mod tests {
         // Pitch bend center: 0xE0 0x00 0x40 = value 8192 - 8192 = 0
         packet.extend_from_slice(&[0x03, 0xE0, 0x00, 0x40]);
 
-        let cmds = parse_rtp_midi(&packet).unwrap();
+        let cmds = synth_cmds(&parse_rtp_midi(&packet).unwrap());
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             SynthCommand::PitchBend { value } => assert_eq!(*value, 0),

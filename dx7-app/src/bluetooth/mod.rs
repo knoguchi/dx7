@@ -13,17 +13,34 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::BleHandler;
 
-use crate::midi;
-use dx7_core::SynthCommand;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod unsupported {
+    //! Stub so `--features bluetooth` still compiles on platforms without a
+    //! BLE peripheral backend (e.g. Windows). `start` always fails.
+    use crate::midi::CommandSink;
+    use std::sync::Arc;
 
-/// Parse a BLE MIDI packet into synth commands.
+    pub struct BleHandler;
+
+    impl BleHandler {
+        pub fn start(_sink: Arc<CommandSink>) -> Result<Self, String> {
+            Err("BLE MIDI peripheral mode is not supported on this platform".into())
+        }
+    }
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub use unsupported::BleHandler;
+
+use crate::midi::{self, MidiMessage};
+
+/// Parse a BLE MIDI packet into MIDI messages.
 ///
 /// BLE MIDI wire format:
 ///   [header: 0b10xxxxxx] [timestamp: 0b1xxxxxxx] [status] [data...] ...
 ///
 /// Multiple MIDI messages can be packed into a single BLE packet.
 /// Running status is supported within a packet.
-pub(crate) fn parse_ble_midi_packet(data: &[u8]) -> Vec<SynthCommand> {
+pub(crate) fn parse_ble_midi_packet(data: &[u8]) -> Vec<MidiMessage> {
     let mut commands = Vec::new();
 
     if data.len() < 3 {
@@ -92,8 +109,8 @@ pub(crate) fn parse_ble_midi_packet(data: &[u8]) -> Vec<SynthCommand> {
         }
         i += data_len;
 
-        if let Some(cmd) = midi::parse_midi_message(&msg) {
-            commands.push(cmd);
+        if let Some(msg) = midi::parse_midi_message(&msg) {
+            commands.push(msg);
         }
     }
 
@@ -122,12 +139,23 @@ fn midi_data_length(status: u8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::midi::MidiMessageKind;
+    use dx7_core::SynthCommand;
+
+    fn synth_cmds(msgs: &[MidiMessage]) -> Vec<SynthCommand> {
+        msgs.iter()
+            .map(|m| match &m.kind {
+                MidiMessageKind::Synth(c) => c.clone(),
+                other => panic!("expected synth command, got {:?}", other),
+            })
+            .collect()
+    }
 
     #[test]
     fn test_parse_note_on() {
         // BLE MIDI packet: header, timestamp, Note On C4 vel=100
         let packet = [0x80, 0x80, 0x90, 60, 100];
-        let cmds = parse_ble_midi_packet(&packet);
+        let cmds = synth_cmds(&parse_ble_midi_packet(&packet));
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             SynthCommand::NoteOn { note, velocity } => {
@@ -141,7 +169,7 @@ mod tests {
     #[test]
     fn test_parse_note_off() {
         let packet = [0x80, 0x80, 0x80, 60, 0];
-        let cmds = parse_ble_midi_packet(&packet);
+        let cmds = synth_cmds(&parse_ble_midi_packet(&packet));
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             SynthCommand::NoteOff { note } => assert_eq!(*note, 60),
@@ -152,7 +180,7 @@ mod tests {
     #[test]
     fn test_parse_note_on_zero_velocity_is_note_off() {
         let packet = [0x80, 0x80, 0x90, 60, 0];
-        let cmds = parse_ble_midi_packet(&packet);
+        let cmds = synth_cmds(&parse_ble_midi_packet(&packet));
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             SynthCommand::NoteOff { note } => assert_eq!(*note, 60),
@@ -164,7 +192,7 @@ mod tests {
     fn test_parse_control_change() {
         // CC#1 (mod wheel) value 64
         let packet = [0x80, 0x80, 0xB0, 1, 64];
-        let cmds = parse_ble_midi_packet(&packet);
+        let cmds = synth_cmds(&parse_ble_midi_packet(&packet));
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             SynthCommand::ControlChange { cc, value } => {
@@ -179,7 +207,7 @@ mod tests {
     fn test_parse_pitch_bend() {
         // Pitch bend center (64 << 7 | 0 = 8192, minus 8192 = 0)
         let packet = [0x80, 0x80, 0xE0, 0x00, 0x40];
-        let cmds = parse_ble_midi_packet(&packet);
+        let cmds = synth_cmds(&parse_ble_midi_packet(&packet));
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             SynthCommand::PitchBend { value } => assert_eq!(*value, 0),
