@@ -109,7 +109,7 @@ BLE packets are parsed per the BLE-MIDI 1.0 spec: header byte, then per message 
 ### Voice Management
 
 - 10-voice polyphony across 2 cores (5 per core)
-- Steal priority: inactive > sustain-held > released > oldest active
+- Steal priority: inactive > released (already decaying) > sustain-held (full level, pedal only) > oldest active
 - Same-note deduplication prevents stuck notes on retrigger (the old instance is killed and its sustain-held flag cleared)
 - CC 120 (All Sound Off) silences voices immediately, with no release stage; CC 123 (All Notes Off) releases them so the envelope tail plays out. In DX7 mode both act on every voice; in GM mode on the message's channel only
 - SysEx bank reception for loading custom DX7 32-voice bulk dumps (USB or BLE)

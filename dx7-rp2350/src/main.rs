@@ -746,17 +746,20 @@ fn dispatch_midi(
             }
             *voice_age += 1;
             let n = voices.len();
-            // Steal priority: inactive > sustain-held > released > oldest active
+            // Steal priority: inactive > released > sustain-held > oldest active.
+            // A Released voice is already decaying, so cutting it is the least
+            // audible; a sustain-held voice is still at full level (the pedal
+            // is the only thing keeping it alive), so it comes next.
             let slot = voices.iter().position(|v| v.state == VoiceState::Inactive)
                 .or_else(|| {
                     voices.iter().enumerate()
-                        .filter(|(_, v)| v.sustain_held)
+                        .filter(|(_, v)| v.state == VoiceState::Released)
                         .min_by_key(|(i, _)| voice_ages[*i])
                         .map(|(i, _)| i)
                 })
                 .or_else(|| {
                     voices.iter().enumerate()
-                        .filter(|(_, v)| v.state == VoiceState::Released)
+                        .filter(|(_, v)| v.sustain_held)
                         .min_by_key(|(i, _)| voice_ages[*i])
                         .map(|(i, _)| i)
                 })
