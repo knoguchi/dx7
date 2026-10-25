@@ -32,12 +32,13 @@ trouble-host = { version = "0.5", default-features = false, features = ["periphe
 
 [build-dependencies]
 reqwest = { version = "0.12", features = ["blocking"], optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [features]
 pwm = []
 i2s = ["dep:fixed"]
 usb-midi = ["dep:embassy-usb"]
-ble-midi = ["dep:cyw43", "dep:cyw43-pio", "dep:trouble-host", "dep:reqwest", "dep:fixed"]
+ble-midi = ["dep:cyw43", "dep:cyw43-pio", "dep:trouble-host", "dep:reqwest", "dep:sha2", "dep:fixed"]
 uart-midi = []
 
 [profile.release]
