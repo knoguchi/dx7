@@ -98,6 +98,12 @@ struct Args {
     #[cfg(feature = "rtp-midi")]
     #[arg(long, default_value_t = 5004)]
     rtp_midi_port: u16,
+
+    /// Only accept RTP-MIDI sessions from this IP address (repeatable).
+    /// Without it any host on the network may connect and play notes.
+    #[cfg(feature = "rtp-midi")]
+    #[arg(long, value_name = "IP")]
+    rtp_midi_allow: Vec<std::net::IpAddr>,
 }
 
 fn main() {
@@ -995,7 +1001,11 @@ fn run_interactive(initial_patch: DxVoice, patches: Vec<DxVoice>, args: &Args) {
 
     #[cfg(feature = "rtp-midi")]
     let _rtp_handler = if args.rtp_midi {
-        match rtpmidi::RtpMidiHandler::start(Some(args.rtp_midi_port), Arc::clone(&sink)) {
+        match rtpmidi::RtpMidiHandler::start(
+            Some(args.rtp_midi_port),
+            args.rtp_midi_allow.clone(),
+            Arc::clone(&sink),
+        ) {
             Ok(h) => {
                 println!(
                     "RTP-MIDI: Listening on port {} (mDNS: \"DX7\")",
