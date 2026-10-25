@@ -426,6 +426,20 @@ fn dispatch_midi(
 
     match msg {
         dx7_midi::MidiMessage::NoteOn { channel, note, velocity } => {
+            // Resolve the patch before touching any voice: a GM drum note with
+            // no DRUM_MAP entry must return without killing or stealing anything.
+            let patch = if synth_mode == 0 {
+                // DX7 mode: always use channels[0].patch, no drum mapping
+                channels[0].patch.clone()
+            } else if channel == 9 {
+                // GM mode: channel 9 = drums
+                match dx7_midi::drum::drum_voice(note) {
+                    Some(dp) => dp,
+                    None => return,
+                }
+            } else {
+                channels[channel as usize].patch.clone()
+            };
             if synth_mode == 0 {
                 // DX7 mode: match by note only (ignore channel for dedup)
                 for v in voices.iter_mut() {
@@ -461,20 +475,6 @@ fn dispatch_midi(
                     (0..n).min_by_key(|&i| voice_ages[i]).unwrap()
                 });
             voices[slot].state = VoiceState::Inactive;
-            let patch;
-            if synth_mode == 0 {
-                // DX7 mode: always use channels[0].patch, no drum mapping
-                patch = channels[0].patch.clone();
-            } else if channel == 9 {
-                // GM mode: channel 9 = drums
-                if let Some(dp) = dx7_midi::drum::drum_voice(note) {
-                    patch = dp;
-                } else {
-                    return;
-                }
-            } else {
-                patch = channels[channel as usize].patch.clone();
-            }
             voices[slot].note_on(&patch, note, velocity);
             voices[slot].channel = channel;
             voices[slot].sustain_held = false;
