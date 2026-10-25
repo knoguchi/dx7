@@ -82,7 +82,7 @@ The firmware supports two operating modes, switchable at runtime via custom SysE
 
 - **DX7 mode** (power-up default): Classic monotimbral operation — one patch for all voices, like a real DX7. Boots with BRASS 1 (ROM1A patch 0). ProgramChange selects from the ROM1A bank (0-31) or a loaded SysEx bank. Pitch bend, mod wheel, and sustain pedal apply globally to all active voices. MIDI receive channel is configurable (default: OMNI).
 
-- **GM mode**: Multitimbral General MIDI operation — per-channel patches from the GM voice map, drums on channel 10 (MIDI ch 9). Intended for MIDI file playback.
+- **GM mode**: Multitimbral General MIDI operation — per-channel patches from the GM voice map, drums on channel 10 (MIDI ch 9). Intended for MIDI file playback. GM programs are level-normalised at mix time (`dx7_midi::gm::program_gain`: bass ×4, solo strings ×1.5, reeds/pipes ×1.3, …) because the underlying DX7 patches differ widely in output level.
 
 ### Custom SysEx Commands
 
@@ -96,19 +96,24 @@ Configure the synth from the host (Pico has no UI). Manufacturer ID `7D` = educa
 
 Channel values: `00`-`0F` = channel 1-16, `7F` = OMNI (respond to all channels).
 
-Mode switches kill all active voices to prevent stuck notes.
+Mode switches release all active voices (CC 123 on every channel) to prevent stuck notes.
+
+SysEx is accepted on every MIDI transport (USB and BLE). On BLE a SysEx message may span several packets, as the BLE-MIDI specification allows, so the 4104-byte bank dump works over Bluetooth too.
 
 ### BLE MIDI
 
 On the Pico 2 W, the CYW43 WiFi/BLE chip provides Bluetooth Low Energy. The firmware advertises as "DX7" and accepts BLE MIDI connections. The onboard LED blinks while advertising and goes solid when a device is connected.
 
+BLE packets are parsed per the BLE-MIDI 1.0 spec: header byte, then per message a timestamp byte, optional status, data. Running status is honoured within a packet; SysEx may span packets and feeds the same SysEx handler as USB.
+
 ### Voice Management
 
 - 10-voice polyphony across 2 cores (5 per core)
-- Steal priority: inactive > sustain-held > released > oldest active
-- Same-note deduplication prevents stuck notes on retrigger
-- CC 120 (All Sound Off) and CC 123 (All Notes Off) release all voices
-- SysEx bank reception for loading custom DX7 32-voice bulk dumps
+- Steal priority: inactive > released (already decaying) > sustain-held (full level, pedal only) > oldest active
+- Same-note deduplication prevents stuck notes on retrigger (the old instance is killed and its sustain-held flag cleared)
+- CC 120 (All Sound Off) silences voices immediately, with no release stage; CC 123 (All Notes Off) releases them so the envelope tail plays out. In DX7 mode both act on every voice; in GM mode on the message's channel only
+- SysEx bank reception for loading custom DX7 32-voice bulk dumps (USB or BLE)
+- The MIDI input queue (256 slots) keeps 32 slots in reserve for NoteOff and Control Change so a NoteOn burst cannot cause a dropped NoteOff; dropped messages are counted and reported over defmt every 500 ms from the CPU-meter task
 
 ## Pin Mapping
 
