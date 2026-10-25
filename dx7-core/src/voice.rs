@@ -537,6 +537,12 @@ impl Voice {
     }
 }
 
+impl Default for Voice {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1046,7 +1052,6 @@ mod tests {
         }
 
         // Analyze raw voice output (i32)
-        let total = all_samples.len();
         let skip = 100 * N; // skip first 100 blocks (~145ms)
         let analysis = &all_samples[skip..];
         let analysis_f64: Vec<f64> = analysis.iter().map(|&s| s as f64).collect();

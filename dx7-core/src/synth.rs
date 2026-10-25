@@ -138,12 +138,11 @@ impl Synth {
                     self.control_change(msg[1], msg[2]);
                 }
             }
-            0xE0 => {
-                if msg.len() >= 3 {
+            0xE0
+                if msg.len() >= 3 => {
                     let bend = ((msg[2] as i16) << 7 | msg[1] as i16) - 8192;
                     self.pitch_bend(bend);
                 }
-            }
             _ => {}
         }
     }
@@ -351,11 +350,10 @@ impl Synth {
         // 2. Find the oldest released voice
         let mut oldest_released: Option<(usize, u32)> = None;
         for (i, voice) in self.voices.iter().enumerate() {
-            if voice.state == VoiceState::Released {
-                if oldest_released.is_none() || voice.age > oldest_released.unwrap().1 {
+            if voice.state == VoiceState::Released
+                && (oldest_released.is_none() || voice.age > oldest_released.unwrap().1) {
                     oldest_released = Some((i, voice.age));
                 }
-            }
         }
         if let Some((idx, _)) = oldest_released {
             return idx;

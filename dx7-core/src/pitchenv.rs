@@ -120,3 +120,9 @@ impl PitchEnv {
         }
     }
 }
+
+impl Default for PitchEnv {
+    fn default() -> Self {
+        Self::new()
+    }
+}

@@ -14,7 +14,6 @@ pub mod envelope;
 pub mod lfo;
 pub mod pitchenv;
 pub mod operator;
-pub mod algorithm;
 pub mod voice;
 pub mod patch;
 pub mod preset;

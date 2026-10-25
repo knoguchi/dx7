@@ -204,6 +204,12 @@ impl Envelope {
     }
 }
 
+impl Default for Envelope {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -105,6 +105,12 @@ impl FmOpParams {
     }
 }
 
+impl Default for FmOpParams {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // --- Log-domain FM operator kernel ---
 //
 // Standard OPL-family log-domain sine technique:
@@ -361,8 +367,7 @@ pub const AMPMODSENSTAB: [u32; 4] = [0, 4342338, 7171437, 16777216];
 pub fn scale_velocity(velocity: i32, sensitivity: i32) -> i32 {
     let clamped_vel = velocity.clamp(0, 127);
     let vel_value = VELOCITY_DATA[(clamped_vel >> 1) as usize] as i32 - 239;
-    let scaled_vel = ((sensitivity * vel_value + 7) >> 3) << 4;
-    scaled_vel
+    ((sensitivity * vel_value + 7) >> 3) << 4
 }
 
 /// Scale envelope rate by keyboard position.
@@ -420,7 +425,7 @@ pub fn osc_freq(midinote: i32, mode: i32, coarse: i32, fine: i32, detune: i32) -
     } else {
         // Fixed frequency mode
         // ((1 << 24) * log(10) / log(2) * 0.01) << 3 = 4458616
-        let mut logfreq = (4458616i64 * ((coarse & 3) * 100 + fine) as i64 >> 3) as i32;
+        let mut logfreq = ((4458616i64 * ((coarse & 3) * 100 + fine) as i64) >> 3) as i32;
         if detune > 7 {
             logfreq += 13457 * (detune - 7);
         }

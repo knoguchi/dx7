@@ -209,3 +209,9 @@ impl Lfo {
         self.delaystate = 0;
     }
 }
+
+impl Default for Lfo {
+    fn default() -> Self {
+        Self::new()
+    }
+}

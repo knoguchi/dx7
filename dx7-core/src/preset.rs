@@ -30,8 +30,5 @@ pub fn bass_1() -> DxVoice {
 /// Uses the complete packed voice data from the rom1a module for all 32 voices.
 /// Returns a default INIT VOICE for out-of-range indices.
 pub fn get_rom1a_preset(index: usize) -> DxVoice {
-    match crate::rom1a::load_rom1a_voice(index) {
-        Some(voice) => voice,
-        None => DxVoice::init_voice(),
-    }
+    crate::rom1a::load_rom1a_voice(index).unwrap_or_default()
 }
