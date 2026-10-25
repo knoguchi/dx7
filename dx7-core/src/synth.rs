@@ -22,7 +22,6 @@ pub struct Synth {
     current_patch: DxVoice,
     _sample_rate: u32,
     sustain: bool,
-    sustained_notes: Vec<u8>,
     master_volume: f32,
     expression: f32,
     /// Pitch bend in the internal log-frequency domain (±12 semitones).
@@ -63,7 +62,6 @@ impl Synth {
             current_patch: DxVoice::init_voice(),
             _sample_rate: sample_rate,
             sustain: false,
-            sustained_notes: Vec::new(),
             master_volume: 0.5,
             expression: 1.0,
             pitch_bend_logfreq: 0,
@@ -102,16 +100,17 @@ impl Synth {
         self.voices[voice_idx].note_on(&self.current_patch, note, velocity);
     }
 
-    /// Trigger a note off.
+    /// Trigger a note off. With the sustain pedal down the voice keeps
+    /// sounding and is flagged `sustain_held`; the pedal release then
+    /// releases exactly those voices, never a key that is still held.
     pub fn note_off(&mut self, note: u8) {
-        if self.sustain {
-            self.sustained_notes.push(note);
-            return;
-        }
-
         for voice in &mut self.voices {
-            if voice.state == VoiceState::Active && voice.note == note {
-                voice.note_off();
+            if voice.state == VoiceState::Active && voice.note == note && !voice.sustain_held {
+                if self.sustain {
+                    voice.sustain_held = true;
+                } else {
+                    voice.note_off();
+                }
             }
         }
     }
@@ -175,12 +174,10 @@ impl Synth {
             64 => {
                 self.sustain = value >= 64; // standard MIDI sustain pedal threshold
                 if !self.sustain {
-                    let notes: Vec<u8> = self.sustained_notes.drain(..).collect();
-                    for note in notes {
-                        for voice in &mut self.voices {
-                            if voice.state == VoiceState::Active && voice.note == note {
-                                voice.note_off();
-                            }
+                    for voice in &mut self.voices {
+                        if voice.sustain_held {
+                            voice.sustain_held = false;
+                            voice.note_off();
                         }
                     }
                 }
@@ -372,5 +369,68 @@ impl Synth {
             }
         }
         oldest_active.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tail_peak(synth: &mut Synth, seconds: f32) -> f32 {
+        let mut out = vec![0.0f32; (44100.0 * seconds) as usize * 2];
+        synth.render(&mut out);
+        out[out.len() - 4096..]
+            .iter()
+            .fold(0.0f32, |a, &b| a.max(b.abs()))
+    }
+
+    /// Issue #4: releasing the pedal must not cut a key that is still held.
+    #[test]
+    fn test_pedal_release_keeps_held_key() {
+        let mut s = Synth::new(44100);
+        s.load_patch(DxVoice::init_voice());
+        s.control_change(64, 127); // pedal down
+        s.note_on(60, 100);
+        s.note_off(60); // key up, pedal holds
+        s.note_on(60, 100); // key down again, still physically held
+        s.control_change(64, 0); // pedal up
+        let peak = tail_peak(&mut s, 1.0);
+        assert!(peak > 0.01, "held key was cut by pedal release, peak={peak}");
+        assert_eq!(
+            s.voices.iter().filter(|v| v.state == VoiceState::Active).count(),
+            1,
+            "only the re-pressed voice should still be active"
+        );
+    }
+
+    /// Issue #4: pedal release does release notes whose keys are up.
+    #[test]
+    fn test_pedal_release_releases_sustained_notes() {
+        let mut s = Synth::new(44100);
+        s.load_patch(DxVoice::init_voice());
+        s.control_change(64, 127);
+        s.note_on(60, 100);
+        s.note_on(64, 100);
+        s.note_off(60);
+        s.note_off(64);
+        assert!(s.voices.iter().filter(|v| v.sustain_held).count() == 2);
+        s.control_change(64, 0);
+        assert!(s.voices.iter().all(|v| !v.sustain_held));
+        let peak = tail_peak(&mut s, 1.0);
+        assert!(peak < 0.001, "sustained notes should have released, peak={peak}");
+    }
+
+    /// Issue #4: a note released with the pedal down and then released
+    /// again (duplicate NoteOff) must not accumulate state.
+    #[test]
+    fn test_duplicate_note_off_under_sustain_is_harmless() {
+        let mut s = Synth::new(44100);
+        s.load_patch(DxVoice::init_voice());
+        s.control_change(64, 127);
+        s.note_on(60, 100);
+        for _ in 0..1000 {
+            s.note_off(60);
+        }
+        assert_eq!(s.voices.iter().filter(|v| v.sustain_held).count(), 1);
     }
 }

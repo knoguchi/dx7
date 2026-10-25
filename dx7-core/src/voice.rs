@@ -156,6 +156,7 @@ impl Voice {
         self.note = note;
         self.velocity = velocity;
         self.state = VoiceState::Active;
+        self.sustain_held = false;
         self.age = 0;
 
         // DX7 patch transpose only applies to the local 61-key keyboard, not MIDI input.
