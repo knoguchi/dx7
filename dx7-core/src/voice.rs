@@ -292,21 +292,28 @@ impl Voice {
         let lfo_val = self.lfo.getsample();
         let lfo_delay = self.lfo.getdelay();
 
-        // --- Pitch modulation (scaled by mod wheel) ---
-        let effective_pmd = (self.pitchmoddepth as i64 * self.mod_wheel as i64 / 127) as i32;
-        let pmd = effective_pmd as u32 as u64 * lfo_delay as u32 as u64;
+        // --- Pitch modulation ---
+        // Two independent sources, combined with max() as in MSFA dx7note.cc:
+        //   pmod_1: the patch's own LFO pitch mod depth (always active, gated
+        //           only by the LFO delay ramp)
+        //   pmod_2: the mod wheel (0..127), mapped like the DX7 function-mode
+        //           wheel with range 99 and pitch assign ON.
+        let pmd = self.pitchmoddepth as u32 as u64 * lfo_delay as u32 as u64;
         let senslfo = self.pitchmodsens * (lfo_val - (1 << 23));
         let pmod_1 = ((pmd as i64 * senslfo as i64) >> 39).unsigned_abs() as i32;
+        let pmod_2 = ((self.mod_wheel as i64 * senslfo as i64) >> 14).unsigned_abs() as i32;
+        let pmod = pmod_1.max(pmod_2);
         let pitch_mod = self.pitchenv.getsample()
-            + pmod_1 * if senslfo < 0 { -1 } else { 1 }
+            + pmod * if senslfo < 0 { -1 } else { 1 }
             + self.pitch_bend;
 
-        // --- Amplitude modulation (scaled by mod wheel) ---
-        let effective_amd = (self.ampmoddepth as i64 * self.mod_wheel as i64 / 127) as i32;
+        // --- Amplitude modulation ---
+        // Same two-source scheme: patch AMD (amod_1) vs mod wheel (amod_2).
         let lfo_val_inv = (1 << 24) - lfo_val;
-        let amod_1 = ((effective_amd as i64 * lfo_delay as i64) >> 8) as u32;
+        let amod_1 = ((self.ampmoddepth as i64 * lfo_delay as i64) >> 8) as u32;
         let amod_1 = ((amod_1 as u64 * lfo_val_inv as u64) >> 24) as u32;
-        let amd_mod = amod_1;
+        let amod_2 = ((self.mod_wheel as i64 * lfo_val_inv as i64) >> 7) as u32;
+        let amd_mod = amod_1.max(amod_2);
 
         // --- Per-operator: compute level and frequency ---
         for op in 0..6 {
@@ -1492,6 +1499,111 @@ mod tests {
         assert!(
             xings2 > xings1,
             "MIDI pitch bend up should increase frequency: before={xings1}, after={xings2}"
+        );
+    }
+
+    /// Instantaneous frequency range (min, max) in Hz over the rendered
+    /// output, from consecutive upward zero crossings. Skips the first
+    /// 0.2 s so envelope attack does not pollute the measurement.
+    fn freq_range(voice: &mut Voice, blocks: usize) -> (f64, f64) {
+        let samples = render_voice(voice, blocks);
+        let mut xs = Vec::new();
+        for i in 8820..samples.len() {
+            if samples[i - 1] < 0 && samples[i] >= 0 {
+                xs.push(i);
+            }
+        }
+        let mut fmin = f64::MAX;
+        let mut fmax = 0.0f64;
+        for w in xs.windows(2) {
+            let f = 44100.0 / (w[1] - w[0]) as f64;
+            fmin = fmin.min(f);
+            fmax = fmax.max(f);
+        }
+        (fmin, fmax)
+    }
+
+    /// Regression for issue #2: LFO pitch mod depth stored in the patch must
+    /// produce vibrato even with the mod wheel at zero (as on a real DX7).
+    #[test]
+    fn test_patch_pmd_applies_without_mod_wheel() {
+        ensure_init();
+        let mut p = DxVoice::init_voice();
+        p.lfo.pitch_mod_depth = 99;
+        p.lfo.speed = 20;
+        p.lfo.delay = 0;
+        p.lfo.waveform = crate::lfo::LfoWaveform::Sine;
+        p.pitch_mod_sensitivity = 7;
+
+        let mut v = Voice::new();
+        v.note_on(&p, 69, 100);
+        v.mod_wheel = 0;
+        let (fmin, fmax) = freq_range(&mut v, 1400);
+        // PMS=7, PMD=99 is roughly +/- 1 octave on the DX7.
+        assert!(
+            fmax / fmin > 2.0,
+            "patch PMD=99 with wheel at 0 should give wide vibrato, got {fmin:.1}..{fmax:.1} Hz"
+        );
+
+        // Zero PMD, wheel at zero: no vibrato at all.
+        p.lfo.pitch_mod_depth = 0;
+        let mut v = Voice::new();
+        v.note_on(&p, 69, 100);
+        let (fmin, fmax) = freq_range(&mut v, 1400);
+        assert!(
+            fmax / fmin < 1.03,
+            "no PMD, no wheel: pitch should be steady, got {fmin:.1}..{fmax:.1} Hz"
+        );
+
+        // Zero PMD but wheel fully up: wheel supplies the vibrato.
+        let mut v = Voice::new();
+        v.note_on(&p, 69, 100);
+        v.mod_wheel = 127;
+        let (fmin, fmax) = freq_range(&mut v, 1400);
+        assert!(
+            fmax / fmin > 1.5,
+            "wheel at 127 should add vibrato, got {fmin:.1}..{fmax:.1} Hz"
+        );
+    }
+
+    /// Issue #2, amplitude side: patch AMD with AMS>0 must produce tremolo
+    /// without the mod wheel.
+    #[test]
+    fn test_patch_amd_applies_without_mod_wheel() {
+        ensure_init();
+        let mut p = DxVoice::init_voice();
+        p.lfo.amp_mod_depth = 99;
+        p.lfo.speed = 20;
+        p.lfo.delay = 0;
+        p.lfo.waveform = crate::lfo::LfoWaveform::Sine;
+        p.operators[5].amp_mod_sensitivity = 3;
+
+        let block_peaks = |p: &DxVoice, wheel: i32| -> (i32, i32) {
+            let mut v = Voice::new();
+            v.note_on(p, 69, 100);
+            v.mod_wheel = wheel;
+            let s = render_voice(&mut v, 1400);
+            let mut lo = i32::MAX;
+            let mut hi = 0;
+            for blk in s[8832..].chunks(N * 4) {
+                let pk = peak(blk);
+                lo = lo.min(pk);
+                hi = hi.max(pk);
+            }
+            (lo, hi)
+        };
+
+        let (lo, hi) = block_peaks(&p, 0);
+        assert!(
+            hi > lo * 2,
+            "patch AMD=99 with wheel at 0 should give tremolo, got peaks {lo}..{hi}"
+        );
+
+        p.lfo.amp_mod_depth = 0;
+        let (lo, hi) = block_peaks(&p, 0);
+        assert!(
+            hi < lo + lo / 10,
+            "no AMD, no wheel: level should be steady, got peaks {lo}..{hi}"
         );
     }
 }
