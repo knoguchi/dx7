@@ -134,8 +134,13 @@ pub fn freqlut_lookup(logfreq: i32) -> i32 {
         let y1 = *FREQLUT.add(ix + 1);
         let lowbits = logfreq & ((1 << FREQ_SAMPLE_SHIFT) - 1);
         let y = y0 + ((((y1 - y0) as i64) * (lowbits as i64)) >> FREQ_SAMPLE_SHIFT) as i32;
+        // Integer part of log2(freq). Coarse 31 + fine 99 + pitch EG +4 oct
+        // + bend on a high note can exceed FREQ_MAX_LOGFREQ_INT, and a deep
+        // negative pitch EG on a low note can go below 0; clamp the shift so
+        // neither direction overflows (would panic in debug, wrap in release).
         let hibits = logfreq >> 24;
-        y >> (FREQ_MAX_LOGFREQ_INT - hibits)
+        let shift = (FREQ_MAX_LOGFREQ_INT - hibits).clamp(0, 31);
+        y >> shift
     }
 }
 
@@ -233,6 +238,19 @@ mod tests {
         let phase_inc = freqlut_lookup(logfreq);
         // phase_inc should be positive and reasonable
         assert!(phase_inc > 0, "Phase increment should be positive, got {phase_inc}");
+    }
+
+    /// Issue #5: shift amount must stay in range for any logfreq.
+    #[test]
+    fn test_freqlut_extreme_logfreq_does_not_panic() {
+        ensure_init();
+        // 24.6 octaves (above FREQ_MAX_LOGFREQ_INT = 20) and well below zero.
+        let hi = freqlut_lookup((24 << 24) + (10 << 20));
+        let lo = freqlut_lookup(-(12 << 24));
+        assert!(hi > 0, "very high logfreq should saturate, not overflow");
+        assert_eq!(lo, 0, "very low logfreq should round to zero");
+        // Within range, higher logfreq still means a larger increment.
+        assert!(freqlut_lookup(19 << 24) > freqlut_lookup(18 << 24));
     }
 
     #[test]
