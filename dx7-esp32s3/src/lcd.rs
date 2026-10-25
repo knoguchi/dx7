@@ -150,7 +150,9 @@ const TEXT_BAND_HEIGHT: u32 = 40;
 /// Must not be called from the audio loop in the async builds; use
 /// [`request_draw`] from there and let [`ui_task`] do the SPI work.
 pub fn draw_patch(program: u8, name: &str) {
-    let display = unsafe { DISPLAY.as_mut().unwrap() };
+    // No-op (not a panic) if `init()` has not run, e.g. a build/entry point
+    // that enables `lcd` but never brought the panel up.
+    let Some(display) = (unsafe { DISPLAY.as_mut() }) else { return };
 
     display
         .fill_solid(

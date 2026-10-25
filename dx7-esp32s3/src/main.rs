@@ -53,7 +53,13 @@ fn init_heap() {
 
 // --- Channel state for MIDI dispatch ---
 
+/// Per-part state. The synth runs in omni mode: the MIDI channel byte is
+/// ignored and every message is routed to this single part, so there is one
+/// `ChannelState`, not sixteen.
 struct ChannelState {
+    /// ROM1A program index (0..32) currently loaded in `patch`. Kept here so
+    /// Program Change and the touch swipe stay in sync.
+    program: u8,
     patch: dx7_core::DxVoice,
     pitch_bend: i32,
     mod_wheel: i32,
@@ -61,8 +67,8 @@ struct ChannelState {
 }
 
 impl ChannelState {
-    fn new(patch: dx7_core::DxVoice) -> Self {
-        Self { patch, pitch_bend: 0, mod_wheel: 0, sustain: false }
+    fn new(program: u8, patch: dx7_core::DxVoice) -> Self {
+        Self { program, patch, pitch_bend: 0, mod_wheel: 0, sustain: false }
     }
 }
 
@@ -201,7 +207,7 @@ fn dispatch_midi(
     voices: &mut [Voice; MAX_VOICES],
     voice_ages: &mut [u32; MAX_VOICES],
     voice_age: &mut u32,
-    channels: &mut [ChannelState; 16],
+    ch: &mut ChannelState,
 ) {
     match msg {
         dx7_midi::MidiMessage::NoteOn { note, velocity, .. } => {
@@ -230,16 +236,16 @@ fn dispatch_midi(
                     (0..MAX_VOICES).min_by_key(|&i| voice_ages[i]).unwrap()
                 });
             voices[slot].state = VoiceState::Inactive;
-            voices[slot].note_on(&channels[0].patch, note, velocity);
+            voices[slot].note_on(&ch.patch, note, velocity);
             voices[slot].sustain_held = false;
-            voices[slot].pitch_bend = channels[0].pitch_bend;
-            voices[slot].mod_wheel = channels[0].mod_wheel;
+            voices[slot].pitch_bend = ch.pitch_bend;
+            voices[slot].mod_wheel = ch.mod_wheel;
             voice_ages[slot] = *voice_age;
         }
         dx7_midi::MidiMessage::NoteOff { note, .. } => {
             for v in voices.iter_mut() {
                 if v.note == note && !v.is_finished() {
-                    if channels[0].sustain {
+                    if ch.sustain {
                         v.sustain_held = true;
                     } else {
                         v.note_off();
@@ -251,7 +257,7 @@ fn dispatch_midi(
             let bend_signed = value as i32 - 8192;
             let bend_range_semitones = 12;
             let bend = (bend_signed * bend_range_semitones * 256) / 8192;
-            channels[0].pitch_bend = bend;
+            ch.pitch_bend = bend;
             for v in voices.iter_mut() {
                 if !v.is_finished() {
                     v.pitch_bend = bend;
@@ -262,7 +268,7 @@ fn dispatch_midi(
             match controller {
                 1 => {
                     let mw = value as i32;
-                    channels[0].mod_wheel = mw;
+                    ch.mod_wheel = mw;
                     for v in voices.iter_mut() {
                         if !v.is_finished() {
                             v.mod_wheel = mw;
@@ -271,7 +277,7 @@ fn dispatch_midi(
                 }
                 64 => {
                     let on = value >= 64;
-                    channels[0].sustain = on;
+                    ch.sustain = on;
                     if !on {
                         for v in voices.iter_mut() {
                             if v.sustain_held {
@@ -295,7 +301,8 @@ fn dispatch_midi(
             if let Some(p) = load_rom1a_voice(program as usize) {
                 #[cfg(feature = "lcd")]
                 lcd::request_draw(program, p.name_str());
-                channels[0].patch = p;
+                ch.program = program;
+                ch.patch = p;
             }
         }
         _ => {}
@@ -407,7 +414,7 @@ async fn ble_midi_synth(bluetooth: esp_hal::peripherals::BT<'static>) -> ! {
     let voice_age = unsafe { &mut mc_render::VOICE_AGE };
     // Start with ROM1A patch 0 (BRASS 1); switch via Program Change
     let init_patch = load_rom1a_voice(0).unwrap();
-    let mut channels: [ChannelState; 16] = core::array::from_fn(|_| ChannelState::new(init_patch.clone()));
+    let mut ch = ChannelState::new(0, init_patch);
 
     #[cfg(feature = "es8311")]
     let mut i2s_buf = [0i16; N * 2];
@@ -489,8 +496,6 @@ async fn ble_midi_synth(bluetooth: esp_hal::peripherals::BT<'static>) -> ! {
         #[allow(static_mut_refs)]
         let mut dma_transfer = i2s_tx.write_dma_circular(unsafe { &mut DMA_BUF }).unwrap();
         #[cfg(feature = "lcd")]
-        let mut current_program: u8 = 0;
-        #[cfg(feature = "lcd")]
         let mut chord_off_countdown: u32 = 0;
         loop {
             // Touch gestures arrive from lcd::ui_task; no I2C/SPI on this path.
@@ -498,14 +503,16 @@ async fn ble_midi_synth(bluetooth: esp_hal::peripherals::BT<'static>) -> ! {
             if let Ok(swipe) = lcd::SWIPE_CHANNEL.try_receive() {
                 match swipe {
                     lcd::Swipe::Up | lcd::Swipe::Down => {
+                        // Step from the program actually loaded (ch.program is also
+                        // updated by Program Change, so swipe and PC stay in sync).
                         let new_prog = match swipe {
-                            lcd::Swipe::Up => if current_program < 31 { current_program + 1 } else { 0 },
-                            _ => if current_program > 0 { current_program - 1 } else { 31 },
+                            lcd::Swipe::Up => if ch.program < 31 { ch.program + 1 } else { 0 },
+                            _ => if ch.program > 0 { ch.program - 1 } else { 31 },
                         };
                         if let Some(p) = load_rom1a_voice(new_prog as usize) {
                             lcd::request_draw(new_prog, p.name_str());
-                            channels[0].patch = p;
-                            current_program = new_prog;
+                            ch.program = new_prog;
+                            ch.patch = p;
                         }
                     }
                     lcd::Swipe::Left => {
@@ -513,7 +520,7 @@ async fn ble_midi_synth(bluetooth: esp_hal::peripherals::BT<'static>) -> ! {
                         for &note in &[60u8, 64, 67] {
                             dispatch_midi(
                                 dx7_midi::MidiMessage::NoteOn { channel: 0, note, velocity: 100 },
-                                voices, voice_ages, voice_age, &mut channels,
+                                voices, voice_ages, voice_age, &mut ch,
                             );
                         }
                         chord_off_countdown = (SAMPLE_RATE as u32) / (N as u32); // ~1 second in blocks
@@ -529,7 +536,7 @@ async fn ble_midi_synth(bluetooth: esp_hal::peripherals::BT<'static>) -> ! {
                     for &note in &[60u8, 64, 67] {
                         dispatch_midi(
                             dx7_midi::MidiMessage::NoteOff { channel: 0, note, velocity: 0 },
-                            voices, voice_ages, voice_age, &mut channels,
+                            voices, voice_ages, voice_age, &mut ch,
                         );
                     }
                 }
@@ -537,7 +544,7 @@ async fn ble_midi_synth(bluetooth: esp_hal::peripherals::BT<'static>) -> ! {
 
             // Drain MIDI queue
             while let Some(msg) = MIDI_QUEUE.pop() {
-                dispatch_midi(msg, voices, voice_ages, voice_age, &mut channels);
+                dispatch_midi(msg, voices, voice_ages, voice_age, &mut ch);
             }
 
             // Signal core 1 to render voices MAX_VOICES/2..MAX_VOICES
@@ -651,6 +658,17 @@ async fn main(_spawner: embassy_executor::Spawner) {
     let timg0 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0);
 
+    // Initialize LCD display (same as the BLE entry point). Without this,
+    // the first Program Change in a usb-midi+lcd build hit an uninitialised
+    // display; draw_patch is now also a no-op in that case.
+    #[cfg(feature = "lcd")]
+    {
+        lcd::init();
+        lcd::draw_patch(0, load_rom1a_voice(0).unwrap().name_str());
+        _spawner.must_spawn(lcd::ui_task());
+        println!("LCD initialized");
+    }
+
     // Initialize shared voice pool
     #[allow(static_mut_refs)]
     unsafe {
@@ -734,7 +752,7 @@ async fn usb_midi_synth() -> ! {
     #[allow(static_mut_refs)]
     let voice_age = unsafe { &mut mc_render::VOICE_AGE };
     let init_patch = load_rom1a_voice(0).unwrap();
-    let mut channels: [ChannelState; 16] = core::array::from_fn(|_| ChannelState::new(init_patch.clone()));
+    let mut ch = ChannelState::new(0, init_patch);
 
     #[cfg(feature = "es8311")]
     let mut i2s_buf = [0i16; N * 2];
@@ -783,7 +801,7 @@ async fn usb_midi_synth() -> ! {
         let mut dma_transfer = i2s_tx.write_dma_circular(unsafe { &mut DMA_BUF }).unwrap();
         loop {
             while let Some(msg) = MIDI_QUEUE.pop() {
-                dispatch_midi(msg, voices, voice_ages, voice_age, &mut channels);
+                dispatch_midi(msg, voices, voice_ages, voice_age, &mut ch);
             }
 
             mc_render::RENDER_DONE.store(false, core::sync::atomic::Ordering::Relaxed);
