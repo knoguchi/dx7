@@ -154,6 +154,7 @@ impl OutputFilterF32 {
 /// The rational form reaches exactly 1.0 at |x| = 3 (108/108) and is monotonic
 /// on [-3, 3], so clamping there is continuous. Clamping at |x| = 1 (as before)
 /// jumped from f(1) = 28/36 ~ 0.778 straight to 1.0 — a 0.22 step at the knee.
+#[cfg(all(any(feature = "usb-midi", feature = "ble-midi"), feature = "pwm"))]
 #[inline(always)]
 fn soft_clip(x: f32) -> f32 {
     if x > 3.0 {
