@@ -1,6 +1,6 @@
 # dx7-esp32s3
 
-Bare-metal DX7 FM synthesizer on ESP32-S3. Uses `dx7-core` for the synth engine — pure integer math, no floating point, no libm.
+Bare-metal DX7 FM synthesizer on ESP32-S3. Uses `dx7-core` for the synth engine (integer-only FM core, no libm). The firmware's own output stage (DC blocker + 4th-order Butterworth low-pass + soft clip) runs in `f32` on the S3's hardware FPU.
 
 ## Setup
 
@@ -12,19 +12,37 @@ cargo install cargo-binstall
 cargo binstall espup
 espup install
 
-# 3. Add xtensa GCC to PATH (add to .bashrc / .zshrc)
-XTENSA_BIN=$(find ~/.rustup/toolchains/esp -name 'xtensa-esp32s3-elf-gcc' -printf '%h' 2>/dev/null)
-export PATH="$XTENSA_BIN:$PATH"
+# 3. Add xtensa GCC to PATH (add to .bashrc / .zshrc; works on Linux and macOS)
+XTENSA_GCC=$(find ~/.rustup/toolchains/esp -name 'xtensa-esp32s3-elf-gcc' -type f 2>/dev/null | head -1)
+export PATH="$(dirname "$XTENSA_GCC"):$PATH"
 
 # 4. Install flashing tool
 cargo binstall espflash
 
-# 5. Apply esp-rom-sys patch (fixes Rust nightly compat)
+# 5. Vendor + patch esp-rom-sys (REQUIRED before any cargo command, see below)
 cd dx7-esp32s3 && bash patches/apply.sh
 
 # 6. For QEMU (optional): install Espressif QEMU fork
 #    https://github.com/espressif/qemu
 ```
+
+### The esp-rom-sys patch
+
+`Cargo.toml` has `[patch.crates-io] esp-rom-sys = { path = "patches/esp-rom-sys" }`.
+That directory is **generated and gitignored**, so on a fresh checkout `cargo build`
+(and even `cargo fetch`) fail with "failed to read patches/esp-rom-sys/Cargo.toml"
+until `bash patches/apply.sh` has run. `run.sh` runs it for you.
+
+`apply.sh` reads the esp-rom-sys version from `Cargo.lock`, copies the crate from the
+cargo registry (or downloads it from crates.io if cargo has not fetched it yet), applies
+`patches/esp-rom-sys.patch`, and writes a stamp with the version + patch checksum. Re-run
+it after bumping esp-hal/esp-rom-sys or editing the patch; it detects the stale copy and
+rebuilds it, and fails loudly (leaving no half-patched directory) if the patch no longer
+applies.
+
+The patch has two hunks: a `strcasecmp` signed/unsigned `char` fix (a real correctness
+fix, worth upstreaming) and one that silences the `function_casts_as_integer` lint on
+recent nightlies.
 
 ## Build
 
@@ -40,6 +58,12 @@ cargo +esp build --release --features es8311
 
 # Real hardware — BLE MIDI + ES8311 audio
 cargo +esp build --release --features "ble-midi,es8311"
+
+# Real hardware — BLE MIDI + ES8311 audio + round LCD / touch (patch name, swipe to change)
+cargo +esp build --release --features "ble-midi,es8311,lcd"
+
+# Real hardware — USB MIDI + ES8311 audio (+ optional lcd)
+cargo +esp build --release --features "usb-midi,es8311"
 ```
 
 ## Run
@@ -95,4 +119,4 @@ Connect from any BLE MIDI controller or app (e.g. KORG microKEY Air, macOS Audio
 
 ## Benchmark
 
-On ESP32-S3 @ 240 MHz, one voice rendering a 64-sample block takes ~30k cycles (~125 µs). The real-time deadline at 48 kHz is 1333 µs, leaving room for ~10 voices.
+The firmware runs the CPU at 160 MHz (`CPU_CLOCK` in `main.rs`). One voice rendering a 64-sample block takes ~30k cycles, i.e. ~190 µs at 160 MHz, against a real-time deadline of 1333 µs at 48 kHz. Polyphony is fixed at `MAX_VOICES = 8`, rendered 4 per core across both cores, which leaves headroom for the output filter, MIDI parsing and (with `ble-midi`) the BLE stack.
