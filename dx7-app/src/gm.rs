@@ -13,7 +13,7 @@ pub struct GmSoundSet {
 impl GmSoundSet {
     /// Load all 128 GM patches from the compiled-in ROM data.
     /// No sysex files needed at runtime.
-    pub fn load(_sysex_dir: &str) -> Self {
+    pub fn load() -> Self {
         let patches: [DxVoice; 128] = std::array::from_fn(|i| {
             gm_voice(i as u8)
         });
@@ -22,6 +22,6 @@ impl GmSoundSet {
 
     /// Get the DX7 patch for a GM program number (0-127).
     pub fn get(&self, program: u8) -> Option<&DxVoice> {
-        Some(&self.patches[program as usize])
+        self.patches.get(program as usize)
     }
 }

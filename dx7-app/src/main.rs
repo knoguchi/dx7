@@ -16,10 +16,10 @@ mod midi;
 mod rtpmidi;
 
 use clap::Parser;
-use crossterm::terminal;
 use dx7_core::{get_rom1a_preset, DxVoice, SynthCommand};
-use std::time::Duration;
 use std::io::Write;
+use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(name = "dx7", about = "DX7 FM Synthesizer Emulator")]
@@ -79,8 +79,13 @@ struct Args {
     #[arg(long)]
     dry: bool,
 
+    /// Skip peak normalization of rendered WAV output. By default output is
+    /// scaled to -1 dBFS peak, which makes --velocity loudness-invariant.
+    #[arg(long)]
+    no_normalize: bool,
+
     /// Enable General MIDI sound set (maps program changes to DX7 patches).
-    /// Requires sysex/ directory with factory, vrc, and greymatter banks.
+    /// Uses the compiled-in GM ROM; no sysex files are needed.
     #[arg(long)]
     gm: bool,
 
@@ -98,6 +103,12 @@ struct Args {
     #[cfg(feature = "rtp-midi")]
     #[arg(long, default_value_t = 5004)]
     rtp_midi_port: u16,
+
+    /// Only accept RTP-MIDI sessions from this IP address (repeatable).
+    /// Without it any host on the network may connect and play notes.
+    #[cfg(feature = "rtp-midi")]
+    #[arg(long, value_name = "IP")]
+    rtp_midi_allow: Vec<std::net::IpAddr>,
 }
 
 fn main() {
@@ -117,9 +128,9 @@ fn main() {
         return;
     }
 
-    // Load patches
+    // Load patches (never empty: falls back to the ROM1A presets)
     let patches = load_patches(&args);
-    let patch_idx = args.patch.min(patches.len() - 1);
+    let patch_idx = args.patch.min(patches.len().saturating_sub(1));
     let initial_patch = patches[patch_idx].clone();
 
     println!("DX7 FM Synthesizer");
@@ -129,13 +140,19 @@ fn main() {
     if let Some(ref midi_path) = args.midi_file {
         let output_path = args.render.as_deref().unwrap_or("output.wav");
         let patch_locked = args.sysex.is_some();
-        render_midi_file(midi_path, output_path, &initial_patch, &patches, patch_locked, &args);
+        if let Err(e) = render_midi_file(midi_path, output_path, &initial_patch, &patches, patch_locked, &args) {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
         return;
     }
 
     // WAV rendering mode (single note)
     if let Some(ref output_path) = args.render {
-        render_wav(output_path, &initial_patch, &args);
+        if let Err(e) = render_wav(output_path, &initial_patch, &args) {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
         return;
     }
 
@@ -147,6 +164,9 @@ fn load_patches(args: &Args) -> Vec<DxVoice> {
     if let Some(ref syx_path) = args.sysex {
         match std::fs::read(syx_path) {
             Ok(data) => match DxVoice::parse_bulk_dump(&data) {
+                Ok(voices) if voices.is_empty() => {
+                    eprintln!("SysEx file {} contains no voices; using ROM1A presets", syx_path);
+                }
                 Ok(voices) => {
                     println!("Loaded {} patches from {}", voices.len(), syx_path);
                     for (i, v) in voices.iter().enumerate() {
@@ -168,7 +188,7 @@ fn load_patches(args: &Args) -> Vec<DxVoice> {
     (0..32).map(get_rom1a_preset).collect()
 }
 
-fn render_wav(output_path: &str, patch: &DxVoice, args: &Args) {
+fn render_wav(output_path: &str, patch: &DxVoice, args: &Args) -> Result<(), String> {
     let sample_rate = args.sample_rate;
     let mut synth = dx7_core::Synth::new(sample_rate);
     synth.load_patch(patch.clone());
@@ -194,15 +214,10 @@ fn render_wav(output_path: &str, patch: &DxVoice, args: &Args) {
     let mut dc = dx7_core::effects::DcBlocker::new(sample_rate as f64);
     dc.process(&mut all_samples);
 
-    // Normalize to -1 dB peak (matches professional headroom)
-    let peak = all_samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-    if peak > 0.0 {
-        let target = 0.891; // -1 dB
-        let gain = target / peak;
-        for s in all_samples.iter_mut() {
-            *s *= gain;
-        }
-        println!("Normalized: peak {:.4} → {:.4} (gain {:.1}x)", peak, target, gain);
+    // Normalize to -1 dB peak (matches professional headroom) unless the
+    // caller wants the engine's natural level (e.g. to compare velocities).
+    if !args.no_normalize {
+        normalize_peak(&mut [&mut all_samples]);
     }
 
     let spec = hound::WavSpec {
@@ -212,16 +227,36 @@ fn render_wav(output_path: &str, patch: &DxVoice, args: &Args) {
         sample_format: hound::SampleFormat::Int,
     };
 
-    let mut writer =
-        hound::WavWriter::create(output_path, spec).expect("Failed to create WAV file");
+    let mut writer = hound::WavWriter::create(output_path, spec)
+        .map_err(|e| format!("Failed to create WAV file {output_path}: {e}"))?;
 
     for &sample in &all_samples {
         let i16_sample = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
-        writer.write_sample(i16_sample).unwrap();
+        writer.write_sample(i16_sample).map_err(|e| format!("Failed to write WAV: {e}"))?;
     }
 
-    writer.finalize().unwrap();
+    writer.finalize().map_err(|e| format!("Failed to finalize WAV: {e}"))?;
     println!("Written {} samples to {}", total_samples, output_path);
+    Ok(())
+}
+
+/// Scale all buffers by one common gain so the loudest sample hits -1 dBFS.
+fn normalize_peak(buffers: &mut [&mut Vec<f32>]) {
+    let peak = buffers
+        .iter()
+        .flat_map(|b| b.iter())
+        .map(|s| s.abs())
+        .fold(0.0f32, f32::max);
+    if peak > 0.0001 {
+        let target = 0.891; // -1 dB headroom
+        let scale = target / peak;
+        for b in buffers.iter_mut() {
+            for s in b.iter_mut() {
+                *s *= scale;
+            }
+        }
+        println!("Normalized: peak {:.4} -> {:.3} (scale {:.3})", peak, target, scale);
+    }
 }
 
 /// A MIDI event parsed from a Standard MIDI File.
@@ -242,33 +277,52 @@ enum MidiEventKind {
     Tempo(u32), // microseconds per beat
 }
 
-/// Parse a Standard MIDI File, returning events sorted by tick.
-fn parse_midi_file(data: &[u8], track_filter: &Option<Vec<usize>>) -> (u16, Vec<MidiEvent>) {
-    let smf = midly::Smf::parse(data).expect("Failed to parse MIDI file");
+impl MidiEventKind {
+    /// Ordering among events that share a tick: tempo changes first so the
+    /// following events are timed correctly, NoteOffs before NoteOns so a
+    /// retriggered note is released before it is struck again (and a later
+    /// track's NoteOff can't cut an earlier track's new NoteOn), and
+    /// controllers/program changes before the notes they affect.
+    fn rank(&self) -> u8 {
+        match self {
+            MidiEventKind::Tempo(_) => 0,
+            MidiEventKind::NoteOff { .. } => 1,
+            MidiEventKind::ControlChange { .. }
+            | MidiEventKind::PitchBend { .. }
+            | MidiEventKind::ProgramChange { .. } => 2,
+            MidiEventKind::NoteOn { .. } => 3,
+        }
+    }
+}
+
+/// Parse a Standard MIDI File, returning (ticks per beat, events sorted by
+/// (tick, rank)). Tempo events are collected from every track regardless of
+/// `track_filter`, since a tempo map may live in any track; channel events
+/// are taken only from the selected tracks (all tracks when `None`).
+fn parse_midi_file(data: &[u8], track_filter: &Option<Vec<usize>>) -> Result<(u16, Vec<MidiEvent>), String> {
+    let smf = midly::Smf::parse(data).map_err(|e| format!("Failed to parse MIDI file: {e}"))?;
 
     let tpb = match smf.header.timing {
         midly::Timing::Metrical(tpb) => tpb.as_int(),
-        midly::Timing::Timecode(..) => panic!("SMPTE timecode not supported"),
+        midly::Timing::Timecode(..) => return Err("SMPTE timecode MIDI files are not supported".into()),
     };
 
     let mut all_events = Vec::new();
 
     for (track_idx, track) in smf.tracks.iter().enumerate() {
-        // Always parse track 0 (tempo map), plus selected tracks
-        let include = track_idx == 0
-            || match track_filter {
-                Some(tracks) => tracks.contains(&track_idx),
-                None => true,
-            };
-        if !include {
-            continue;
-        }
+        let include = match track_filter {
+            Some(tracks) => tracks.contains(&track_idx),
+            None => true,
+        };
 
         let mut tick: u64 = 0;
         for event in track {
             tick += event.delta.as_int() as u64;
             match event.kind {
                 midly::TrackEventKind::Midi { channel, message } => {
+                    if !include {
+                        continue;
+                    }
                     let ch = channel.as_int();
                     let kind = match message {
                         midly::MidiMessage::NoteOn { key, vel } => {
@@ -316,10 +370,11 @@ fn parse_midi_file(data: &[u8], track_filter: &Option<Vec<usize>>) -> (u16, Vec<
         }
     }
 
-    // Sort by tick (stable sort preserves order for same-tick events)
-    all_events.sort_by_key(|e| e.tick);
+    // Stable sort by (tick, rank): same-tick events keep file order within a
+    // rank, but Tempo < NoteOff < CC/bend/program < NoteOn across ranks.
+    all_events.sort_by_key(|e| (e.tick, e.kind.rank()));
 
-    (tpb, all_events)
+    Ok((tpb, all_events))
 }
 
 // ── Synthesized Drum Machine (GM channel 9) ──────────────────────────
@@ -590,9 +645,53 @@ fn parse_channel_map(entries: &[String]) -> Vec<(usize, DxVoice, f32, f32)> {
     result
 }
 
-fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches: &[DxVoice], patch_locked: bool, args: &Args) {
-    let data = std::fs::read(midi_path).expect("Failed to read MIDI file");
-    let (division, events) = parse_midi_file(&data, &args.track);
+/// Default per-channel reverb send; restored when a channel leaves a bass program.
+const DEFAULT_REVERB_SEND: f32 = 0.15;
+
+/// Mix every synth channel for `len` samples into the stereo bus and the
+/// reverb send, applying per-channel DC blocking, volume and constant-power
+/// panning (L = cos θ, R = sin θ, θ = pan·π/2: -3 dB at centre, 0 dB hard).
+#[allow(clippy::too_many_arguments)]
+fn mix_synth_channels(
+    synths: &mut [dx7_core::Synth],
+    dc_blockers: &mut [dx7_core::effects::DcBlocker],
+    channel_volume: &[f32; 16],
+    channel_gm_gain: &[f32; 16],
+    channel_pan: &[f32; 16],
+    channel_reverb: &[f32; 16],
+    temp: &mut [f32],
+    left: &mut [f32],
+    right: &mut [f32],
+    reverb_send: &mut [f32],
+) {
+    let len = temp.len();
+    for (ch_idx, synth) in synths.iter_mut().enumerate() {
+        temp.fill(0.0);
+        synth.render_mono(temp);
+        dc_blockers[ch_idx].process(temp);
+        let vol = channel_volume[ch_idx] * channel_gm_gain[ch_idx];
+        let theta = std::f32::consts::FRAC_PI_2 * channel_pan[ch_idx].clamp(0.0, 1.0);
+        let l_gain = theta.cos() * vol;
+        let r_gain = theta.sin() * vol;
+        let rev_gain = vol * channel_reverb[ch_idx];
+        for i in 0..len {
+            left[i] += temp[i] * l_gain;
+            right[i] += temp[i] * r_gain;
+            reverb_send[i] += temp[i] * rev_gain;
+        }
+    }
+}
+
+fn render_midi_file(
+    midi_path: &str,
+    output_path: &str,
+    patch: &DxVoice,
+    patches: &[DxVoice],
+    patch_locked: bool,
+    args: &Args,
+) -> Result<(), String> {
+    let data = std::fs::read(midi_path).map_err(|e| format!("Failed to read MIDI file {midi_path}: {e}"))?;
+    let (division, events) = parse_midi_file(&data, &args.track)?;
 
     println!(
         "MIDI: {} events, {} ticks/beat",
@@ -618,7 +717,7 @@ fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches
     // Channels with overrides ignore ProgramChange events from the MIDI file.
     let mut mapped_channels = [false; 16];
     let mut channel_volume = [1.0f32; 16];
-    let mut channel_reverb = [0.15f32; 16]; // default reverb send per channel
+    let mut channel_reverb = [DEFAULT_REVERB_SEND; 16]; // default reverb send per channel
     channel_reverb[9] = 0.0; // drums: dry by default
     let mut channel_gm_gain = [1.0f32; 16]; // per-program gain compensation (GM mode)
     // DC-blocking filters — one per channel.
@@ -626,9 +725,6 @@ fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches
     // the real DX7's coupling capacitors removed this.
     let mut dc_blockers: Vec<dx7_core::effects::DcBlocker> = (0..16)
         .map(|_| dx7_core::effects::DcBlocker::new(sample_rate as f64))
-        .collect();
-    let mut bass_lpf: Vec<Option<dx7_core::effects::LowPassFilter>> = (0..16)
-        .map(|_| None)
         .collect();
     if !args.channel_map.is_empty() {
         println!("Channel map:");
@@ -643,7 +739,7 @@ fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches
 
     // Load GM sound set if --gm flag is set
     let gm_set = if args.gm {
-        let gm = gm::GmSoundSet::load("sysex");
+        let gm = gm::GmSoundSet::load();
         println!("GM: loaded 128-program sound set");
         // Set initial patch on all non-mapped channels to GM program 0 (Acoustic Grand Piano)
         for (ch, synth) in synths.iter_mut().enumerate() {
@@ -661,10 +757,12 @@ fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches
     // Drum machine for GM channel 10 (index 9)
     let mut drums = DrumMachine::new(sample_rate as f64);
 
-    // Render by walking through events, converting tick→sample position
+    // Render by walking through events, converting tick→sample position.
+    // The exact position is kept in f64 and only rounded when deciding how
+    // many samples to emit, so per-event truncation can't accumulate drift.
     let mut tempo: u32 = 500_000; // default 120 BPM (standard MIDI default)
     let mut current_tick: u64 = 0;
-    let mut _current_sample: u64 = 0;
+    let mut sample_pos: f64 = 0.0;
     // Per-channel stereo panning (0.0 = hard left, 0.5 = center, 1.0 = hard right)
     // Default spread gives each active channel a slightly different position.
     let mut channel_pan = [0.5f32; 16];
@@ -692,50 +790,42 @@ fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches
     let mut drum_samples: Vec<f32> = Vec::new();
     let mut reverb_send: Vec<f32> = Vec::new(); // per-channel reverb send (mono)
 
+    let mut temp: Vec<f32> = Vec::new();
+
     for event in &events {
         if event.tick > current_tick {
-            // Render samples between current position and this event
+            // Advance the exact sample position, then render up to it.
             let delta_ticks = event.tick - current_tick;
-            let delta_samples = (delta_ticks as f64 * tempo as f64 * sample_rate as f64)
+            sample_pos += (delta_ticks as f64 * tempo as f64 * sample_rate as f64)
                 / (division as f64 * 1_000_000.0);
-            let delta_samples = delta_samples as u64;
+            current_tick = event.tick;
 
-            if delta_samples > 0 {
-                let len = delta_samples as usize;
-                let start = left_samples.len();
-                left_samples.resize(start + len, 0.0);
-                right_samples.resize(start + len, 0.0);
-                drum_samples.resize(start + len, 0.0);
-                reverb_send.resize(start + len, 0.0);
+            let start = left_samples.len();
+            let target = sample_pos.round() as usize;
+            if target > start {
+                let len = target - start;
+                left_samples.resize(target, 0.0);
+                right_samples.resize(target, 0.0);
+                drum_samples.resize(target, 0.0);
+                reverb_send.resize(target, 0.0);
 
-                // Mix each synth channel with panning
-                let mut temp = vec![0.0f32; len];
-                for (ch_idx, synth) in synths.iter_mut().enumerate() {
-                    temp.iter_mut().for_each(|s| *s = 0.0);
-                    synth.render_mono(&mut temp);
-                    dc_blockers[ch_idx].process(&mut temp);
-                    if let Some(ref mut lpf) = bass_lpf[ch_idx] {
-                        lpf.process(&mut temp);
-                    }
-                    let vol = channel_volume[ch_idx] * channel_gm_gain[ch_idx];
-                    let pan = channel_pan[ch_idx];
-                    // Equal-power panning
-                    let l_gain = (std::f32::consts::FRAC_PI_2 * (1.0 - pan)).cos().max(0.0).sqrt() * vol;
-                    let r_gain = (std::f32::consts::FRAC_PI_2 * pan).cos().max(0.0).sqrt() * vol;
-                    let rev = channel_reverb[ch_idx];
-                    for i in 0..len {
-                        left_samples[start + i] += temp[i] * l_gain;
-                        right_samples[start + i] += temp[i] * r_gain;
-                        reverb_send[start + i] += temp[i] * vol * rev;
-                    }
-                }
+                temp.resize(len, 0.0);
+                mix_synth_channels(
+                    &mut synths,
+                    &mut dc_blockers,
+                    &channel_volume,
+                    &channel_gm_gain,
+                    &channel_pan,
+                    &channel_reverb,
+                    &mut temp[..len],
+                    &mut left_samples[start..],
+                    &mut right_samples[start..],
+                    &mut reverb_send[start..],
+                );
 
                 // Mix drums separately (center)
                 drums.render(&mut drum_samples[start..]);
-
             }
-            current_tick = event.tick;
-            _current_sample += delta_samples;
         }
 
         let ch = event.channel as usize;
@@ -778,10 +868,13 @@ fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches
                         if let Some(p) = gm.get(*program) {
                             synths[ch].load_patch(p.clone());
                             channel_gm_gain[ch] = gm::program_gain(*program);
-                            // Bass instruments: dry (no reverb) for tight low end
-                            if gm::is_bass_program(*program) {
-                                channel_reverb[ch] = 0.0;
-                            }
+                            // Bass instruments: dry (no reverb) for tight low
+                            // end; anything else gets the default send back.
+                            channel_reverb[ch] = if gm::is_bass_program(*program) {
+                                0.0
+                            } else {
+                                DEFAULT_REVERB_SEND
+                            };
                         }
                     } else if let Some(p) = patches.get(*program as usize) {
                         synths[ch].load_patch(p.clone());
@@ -801,25 +894,19 @@ fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches
     right_samples.resize(start + tail, 0.0);
     drum_samples.resize(start + tail, 0.0);
     reverb_send.resize(start + tail, 0.0);
-    let mut temp = vec![0.0f32; tail];
-    for (ch_idx, synth) in synths.iter_mut().enumerate() {
-        temp.iter_mut().for_each(|s| *s = 0.0);
-        synth.render_mono(&mut temp);
-        dc_blockers[ch_idx].process(&mut temp);
-        if let Some(ref mut lpf) = bass_lpf[ch_idx] {
-            lpf.process(&mut temp);
-        }
-        let vol = channel_volume[ch_idx] * channel_gm_gain[ch_idx];
-        let pan = channel_pan[ch_idx];
-        let l_gain = (std::f32::consts::FRAC_PI_2 * (1.0 - pan)).cos().max(0.0).sqrt() * vol;
-        let r_gain = (std::f32::consts::FRAC_PI_2 * pan).cos().max(0.0).sqrt() * vol;
-        let rev = channel_reverb[ch_idx];
-        for i in 0..tail {
-            left_samples[start + i] += temp[i] * l_gain;
-            right_samples[start + i] += temp[i] * r_gain;
-            reverb_send[start + i] += temp[i] * vol * rev;
-        }
-    }
+    temp.resize(tail, 0.0);
+    mix_synth_channels(
+        &mut synths,
+        &mut dc_blockers,
+        &channel_volume,
+        &channel_gm_gain,
+        &channel_pan,
+        &channel_reverb,
+        &mut temp[..tail],
+        &mut left_samples[start..],
+        &mut right_samples[start..],
+        &mut reverb_send[start..],
+    );
     drums.render(&mut drum_samples[start..]);
 
     let num = left_samples.len();
@@ -890,25 +977,9 @@ fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches
         widener.process_stereo(&mut left, &mut right);
     }
 
-    // Normalize stereo output to -1 dB headroom
-    let peak = left
-        .iter()
-        .chain(right.iter())
-        .map(|s| s.abs())
-        .fold(0.0f32, f32::max);
-    if peak > 0.0001 {
-        let target = 0.891; // -1 dB headroom
-        let scale = target / peak;
-        for s in left.iter_mut() {
-            *s *= scale;
-        }
-        for s in right.iter_mut() {
-            *s *= scale;
-        }
-        eprintln!(
-            "Normalized: peak {:.4} -> {:.3} (scale {:.3})",
-            peak, target, scale
-        );
+    // Normalize stereo output to -1 dB headroom (unless --no-normalize)
+    if !args.no_normalize {
+        normalize_peak(&mut [&mut left, &mut right]);
     }
 
     let duration_secs = num as f64 / sample_rate as f64;
@@ -924,18 +995,32 @@ fn render_midi_file(midi_path: &str, output_path: &str, patch: &DxVoice, patches
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut writer =
-        hound::WavWriter::create(output_path, spec).expect("Failed to create WAV file");
+    let mut writer = hound::WavWriter::create(output_path, spec)
+        .map_err(|e| format!("Failed to create WAV file {output_path}: {e}"))?;
     for i in 0..num {
         let l = (left[i] * 32767.0).clamp(-32768.0, 32767.0) as i16;
         let r = (right[i] * 32767.0).clamp(-32768.0, 32767.0) as i16;
-        writer.write_sample(l).unwrap();
-        writer.write_sample(r).unwrap();
+        writer
+            .write_sample(l)
+            .and_then(|_| writer.write_sample(r))
+            .map_err(|e| format!("Failed to write WAV: {e}"))?;
     }
-    writer.finalize().unwrap();
+    writer.finalize().map_err(|e| format!("Failed to finalize WAV: {e}"))?;
+    Ok(())
 }
 
 fn run_interactive(initial_patch: DxVoice, patches: Vec<DxVoice>, args: &Args) {
+    // Flags that only affect MIDI-file rendering are silently useless here.
+    if args.gm {
+        eprintln!("Warning: --gm only applies to --midi-file rendering; ignored in interactive mode");
+    }
+    if !args.channel_map.is_empty() {
+        eprintln!("Warning: --ch only applies to --midi-file rendering; ignored in interactive mode");
+    }
+    if args.track.is_some() {
+        eprintln!("Warning: --track only applies to --midi-file rendering; ignored in interactive mode");
+    }
+
     let engine = match audio::AudioEngine::start(initial_patch) {
         Ok(e) => e,
         Err(err) => {
@@ -946,12 +1031,12 @@ fn run_interactive(initial_patch: DxVoice, patches: Vec<DxVoice>, args: &Args) {
 
     println!("Audio: {} Hz", engine.sample_rate);
 
+    // Shared dispatch path for every live input (MIDI, BLE, RTP, keyboard).
+    // Program Change messages select from `patches`, like the 1-0 keys.
+    let sink = Arc::new(midi::CommandSink::new(engine.command_sender(), patches));
 
     // Try to connect MIDI using the shared command channel
-    let midi_handler = match midi::MidiHandler::connect(
-        args.midi_port.as_deref(),
-        engine.command_sender(),
-    ) {
+    let midi_handler = match midi::MidiHandler::connect(args.midi_port.as_deref(), Arc::clone(&sink)) {
         Ok(h) => {
             println!("MIDI: {}", h.port_name);
             Some(h)
@@ -965,7 +1050,7 @@ fn run_interactive(initial_patch: DxVoice, patches: Vec<DxVoice>, args: &Args) {
 
     #[cfg(feature = "bluetooth")]
     let _ble_handler = if args.bluetooth {
-        match bluetooth::BleHandler::start(engine.command_sender()) {
+        match bluetooth::BleHandler::start(Arc::clone(&sink)) {
             Ok(h) => {
                 println!("BLE MIDI: Advertising as \"DX7\"");
                 Some(h)
@@ -981,7 +1066,11 @@ fn run_interactive(initial_patch: DxVoice, patches: Vec<DxVoice>, args: &Args) {
 
     #[cfg(feature = "rtp-midi")]
     let _rtp_handler = if args.rtp_midi {
-        match rtpmidi::RtpMidiHandler::start(Some(args.rtp_midi_port), engine.command_sender()) {
+        match rtpmidi::RtpMidiHandler::start(
+            Some(args.rtp_midi_port),
+            args.rtp_midi_allow.clone(),
+            Arc::clone(&sink),
+        ) {
             Ok(h) => {
                 println!(
                     "RTP-MIDI: Listening on port {} (mDNS: \"DX7\")",
@@ -1004,10 +1093,25 @@ fn run_interactive(initial_patch: DxVoice, patches: Vec<DxVoice>, args: &Args) {
     println!("  WETYUOP    = black keys");
     println!("  Z/X        = octave down/up");
     println!("  1-9,0      = select patch");
-    println!("  Q/Esc      = quit");
+    println!("  Q/Esc/^C   = quit");
     println!();
 
-    terminal::enable_raw_mode().expect("Failed to enable raw mode");
+    // RAII guard: restores cooked mode (and pops keyboard-enhancement
+    // flags) on drop, including during a panic.
+    let raw_guard = match keyboard::RawModeGuard::enter() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("Failed to enable raw mode: {e}");
+            return;
+        }
+    };
+    if !raw_guard.release_supported() {
+        print!(
+            "  Note: this terminal does not report key release events;\r\n\
+             notes sustain until the same key is pressed again.\r\n"
+        );
+        let _ = std::io::stdout().flush();
+    }
 
     let mut kbd = keyboard::KeyboardHandler::new();
 
@@ -1017,33 +1121,106 @@ fn run_interactive(initial_patch: DxVoice, patches: Vec<DxVoice>, args: &Args) {
         for event in &events {
             match event {
                 keyboard::KeyboardEvent::NoteOn(note, vel) => {
-                    engine.send_command(SynthCommand::NoteOn {
+                    sink.send(SynthCommand::NoteOn {
                         note: *note,
                         velocity: *vel,
                     });
                 }
                 keyboard::KeyboardEvent::NoteOff(note) => {
-                    engine.send_command(SynthCommand::NoteOff { note: *note });
+                    sink.send(SynthCommand::NoteOff { note: *note });
                 }
                 keyboard::KeyboardEvent::OctaveChange(oct) => {
                     print!("\r\x1b[K  Octave: {:+}\r", oct);
                 }
                 keyboard::KeyboardEvent::PatchChange(idx) => {
                     let idx = *idx as usize;
-                    if idx < patches.len() {
-                        let patch = patches[idx].clone();
-                        let name = patch.name_str().to_string();
-                        engine.send_command(SynthCommand::LoadPatch(Box::new(patch)));
+                    if let Some(name) = sink.select_patch(idx) {
                         print!("\r\x1b[K  Patch {}: {}\r", idx, name);
-                        std::io::stdout().flush().unwrap();
+                        let _ = std::io::stdout().flush();
                     }
                 }
                 keyboard::KeyboardEvent::Quit => {
-                    terminal::disable_raw_mode().ok();
-                    println!("\r\nBye!");
+                    drop(raw_guard);
+                    println!("\nBye!");
                     return;
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod midi_file_tests {
+    use super::*;
+    use midly::num::{u15, u24, u28, u4, u7};
+    use midly::{Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind};
+
+    fn note(delta: u32, on: bool, key: u8) -> TrackEvent<'static> {
+        let message = if on {
+            MidiMessage::NoteOn { key: u7::new(key), vel: u7::new(100) }
+        } else {
+            MidiMessage::NoteOff { key: u7::new(key), vel: u7::new(0) }
+        };
+        TrackEvent {
+            delta: u28::new(delta),
+            kind: TrackEventKind::Midi { channel: u4::new(0), message },
+        }
+    }
+
+    fn tempo(delta: u32, us_per_beat: u32) -> TrackEvent<'static> {
+        TrackEvent {
+            delta: u28::new(delta),
+            kind: TrackEventKind::Meta(MetaMessage::Tempo(u24::new(us_per_beat))),
+        }
+    }
+
+    /// Three-track file: track 0 holds the initial tempo, track 1 plays C4 for
+    /// a beat, track 2 changes tempo and restrikes C4 exactly where track 1
+    /// releases it.
+    fn test_smf() -> Vec<u8> {
+        let mut smf = Smf::new(Header::new(Format::Parallel, Timing::Metrical(u15::new(480))));
+        smf.tracks.push(vec![tempo(0, 500_000)]);
+        smf.tracks.push(vec![note(0, true, 60), note(480, false, 60)]);
+        smf.tracks.push(vec![tempo(480, 250_000), note(0, true, 60)]);
+        let mut bytes = Vec::new();
+        smf.write_std(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn tempo_is_collected_from_every_track_despite_filter() {
+        let (tpb, events) = parse_midi_file(&test_smf(), &Some(vec![1])).unwrap();
+        assert_eq!(tpb, 480);
+        let tempos: Vec<u32> = events
+            .iter()
+            .filter_map(|e| match e.kind {
+                MidiEventKind::Tempo(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tempos, vec![500_000, 250_000]);
+        // Track 2's NoteOn was filtered out; track 1's two note events remain.
+        assert_eq!(events.iter().filter(|e| !matches!(e.kind, MidiEventKind::Tempo(_))).count(), 2);
+    }
+
+    #[test]
+    fn same_tick_events_order_tempo_noteoff_noteon() {
+        let (_, events) = parse_midi_file(&test_smf(), &None).unwrap();
+        let at_480: Vec<u8> = events.iter().filter(|e| e.tick == 480).map(|e| e.kind.rank()).collect();
+        assert_eq!(at_480, vec![0, 1, 3], "{events:?}");
+        assert!(matches!(events.iter().find(|e| e.tick == 480).unwrap().kind, MidiEventKind::Tempo(250_000)));
+    }
+
+    #[test]
+    fn smpte_timing_is_an_error_not_a_panic() {
+        let smf = Smf::new(Header::new(
+            Format::SingleTrack,
+            Timing::Timecode(midly::Fps::Fps25, 40),
+        ));
+        let mut bytes = Vec::new();
+        smf.write_std(&mut bytes).unwrap();
+        let err = parse_midi_file(&bytes, &None).unwrap_err();
+        assert!(err.contains("SMPTE"), "{err}");
+        assert!(parse_midi_file(b"not a midi file", &None).is_err());
     }
 }

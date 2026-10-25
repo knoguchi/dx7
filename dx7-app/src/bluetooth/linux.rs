@@ -1,17 +1,20 @@
 //! BLE MIDI peripheral using BlueZ (Linux only).
 
 use super::parse_ble_midi_packet;
+use crate::midi::CommandSink;
 use bluer::{
     adv::Advertisement,
-    gatt::local::{
-        Application, Characteristic, CharacteristicNotify, CharacteristicNotifyMethod,
-        CharacteristicWrite, CharacteristicWriteMethod, Service,
+    gatt::{
+        local::{
+            characteristic_control, Application, Characteristic, CharacteristicControlEvent,
+            CharacteristicNotify, CharacteristicNotifyMethod, CharacteristicRead,
+            CharacteristicWrite, CharacteristicWriteMethod, Service,
+        },
+        CharacteristicReader, CharacteristicWriter,
     },
 };
-use dx7_core::SynthCommand;
-use futures::StreamExt;
-use ringbuf::traits::Producer;
-use std::sync::{Arc, Mutex};
+use futures::{FutureExt, StreamExt};
+use std::sync::Arc;
 use tokio::sync::oneshot;
 
 /// BLE MIDI Service UUID (standard BLE MIDI spec).
@@ -31,9 +34,7 @@ pub struct BleHandler {
 
 impl BleHandler {
     /// Start the BLE MIDI peripheral in a background thread.
-    pub fn start(
-        command_tx: Arc<Mutex<ringbuf::HeapProd<SynthCommand>>>,
-    ) -> Result<Self, String> {
+    pub fn start(sink: Arc<CommandSink>) -> Result<Self, String> {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
@@ -52,7 +53,7 @@ impl BleHandler {
                 };
 
                 rt.block_on(async move {
-                    match ble_server_task(command_tx, shutdown_rx, &ready_tx).await {
+                    match ble_server_task(sink, shutdown_rx, &ready_tx).await {
                         Ok(()) => {}
                         Err(e) => {
                             // If ready_tx hasn't been consumed yet, send the error
@@ -78,7 +79,7 @@ impl BleHandler {
 
 /// Main async task: register GATT service, advertise, and handle connections.
 async fn ble_server_task(
-    command_tx: Arc<Mutex<ringbuf::HeapProd<SynthCommand>>>,
+    sink: Arc<CommandSink>,
     shutdown_rx: oneshot::Receiver<()>,
     ready_tx: &std::sync::mpsc::Sender<Result<(), String>>,
 ) -> Result<(), String> {
@@ -96,13 +97,12 @@ async fn ble_server_task(
         .await
         .map_err(|e| format!("Failed to power on adapter: {e}"))?;
 
-    // Create the MIDI I/O characteristic with Write (for receiving MIDI)
-    // and Notify (required by BLE MIDI spec, though we don't send data).
-    let (char_write_tx, mut char_write_rx) =
-        tokio::io::duplex(256);
-
-    let (_char_notify_tx, char_notify_rx) =
-        tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    // The MIDI I/O characteristic. BLE-MIDI requires Read (returns no
+    // data), Write Without Response (how centrals send us MIDI) and
+    // Notify (how we would send MIDI; unused). With the Io write method
+    // BlueZ hands us a socket per connecting central via the control
+    // stream, which is the only way the written bytes reach us.
+    let (char_control, char_control_handle) = characteristic_control();
 
     let app = Application {
         services: vec![Service {
@@ -110,7 +110,13 @@ async fn ble_server_task(
             primary: true,
             characteristics: vec![Characteristic {
                 uuid: MIDI_CHAR_UUID,
+                read: Some(CharacteristicRead {
+                    read: true,
+                    fun: Box::new(|_req| async { Ok(Vec::new()) }.boxed()),
+                    ..Default::default()
+                }),
                 write: Some(CharacteristicWrite {
+                    write: true,
                     write_without_response: true,
                     method: CharacteristicWriteMethod::Io,
                     ..Default::default()
@@ -120,6 +126,7 @@ async fn ble_server_task(
                     method: CharacteristicNotifyMethod::Io,
                     ..Default::default()
                 }),
+                control_handle: char_control_handle,
                 ..Default::default()
             }],
             ..Default::default()
@@ -148,31 +155,59 @@ async fn ble_server_task(
     // Signal that we're ready
     let _ = ready_tx.send(Ok(()));
 
-    // Event loop: read BLE MIDI packets and forward to synth engine
-    let mut buf = [0u8; 256];
+    // Event loop: accept write sessions from the control stream, then read
+    // BLE MIDI packets (one datagram per write) and forward them to the synth.
+    let mut char_control = char_control;
     let mut shutdown_rx = shutdown_rx;
+    let mut reader: Option<CharacteristicReader> = None;
+    // Kept alive so the notify session stays open; we never send.
+    let mut _notify_writer: Option<CharacteristicWriter> = None;
 
     loop {
         tokio::select! {
             _ = &mut shutdown_rx => {
                 break;
             }
-            result = tokio::io::AsyncReadExt::read(&mut char_write_rx, &mut buf) => {
-                match result {
-                    Ok(0) => {
-                        // Client disconnected, keep listening for next connection
-                        continue;
-                    }
-                    Ok(n) => {
-                        let commands = parse_ble_midi_packet(&buf[..n]);
-                        if let Ok(mut tx) = command_tx.lock() {
-                            for cmd in commands {
-                                let _ = tx.try_push(cmd);
+            evt = char_control.next() => {
+                match evt {
+                    Some(CharacteristicControlEvent::Write(req)) => {
+                        let addr = req.device_address();
+                        let mtu = req.mtu();
+                        match req.accept() {
+                            Ok(r) => {
+                                eprintln!("BLE MIDI: {addr} connected (MTU {mtu})");
+                                reader = Some(r);
                             }
+                            Err(e) => eprintln!("BLE MIDI: failed to accept write from {addr}: {e}"),
                         }
                     }
-                    Err(_) => {
-                        continue;
+                    Some(CharacteristicControlEvent::Notify(w)) => {
+                        eprintln!("BLE MIDI: {} subscribed to notifications", w.device_address());
+                        _notify_writer = Some(w);
+                    }
+                    None => {
+                        eprintln!("BLE MIDI: GATT application unregistered");
+                        break;
+                    }
+                }
+            }
+            packet = async {
+                match &reader {
+                    Some(r) => r.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match packet {
+                    Ok(bytes) if bytes.is_empty() => {
+                        eprintln!("BLE MIDI: central disconnected");
+                        reader = None;
+                    }
+                    Ok(bytes) => {
+                        sink.dispatch_all(parse_ble_midi_packet(&bytes));
+                    }
+                    Err(e) => {
+                        eprintln!("BLE MIDI: read error ({e}); waiting for reconnect");
+                        reader = None;
                     }
                 }
             }
