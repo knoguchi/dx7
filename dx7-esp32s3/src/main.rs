@@ -24,6 +24,17 @@ const CPU_CLOCK: esp_hal::clock::CpuClock = esp_hal::clock::CpuClock::_160MHz;
 const CPU_HZ: u32 = CPU_CLOCK as u32 * 1_000_000;
 const MAX_VOICES: usize = 8;
 
+/// MCLK the ES8311 is programmed for. This is an *assumption* about what
+/// esp-hal generates, not something we read back: esp-hal 1.0.0
+/// (`i2s/master.rs`, `I2sClockDividers::new`) uses `mclk = rate * 256` for
+/// 16-bit data, giving 12.288 MHz at 48 kHz, which must match the
+/// `COEFFS` row es8311.rs selects. If SAMPLE_RATE or the data width changes,
+/// re-check both.
+#[cfg(feature = "es8311")]
+const MCLK_HZ: u32 = SAMPLE_RATE * 256;
+#[cfg(feature = "es8311")]
+const _: () = assert!(MCLK_HZ == 12_288_000, "ES8311 coefficient table assumes 12.288 MHz MCLK");
+
 #[cfg(not(any(feature = "ble-midi", feature = "usb-midi")))]
 const BLOCK_DEADLINE_US: u64 = (N as u64 * 1_000_000) / SAMPLE_RATE as u64;
 #[cfg(feature = "pwm")]
@@ -901,9 +912,10 @@ fn setup_i2s_es8311() -> (
     .with_scl(i2c_scl)
     .with_sda(i2c_sda);
 
-    const MCLK_HZ: u32 = SAMPLE_RATE * 256;
-    es8311::init(&mut i2c, MCLK_HZ, SAMPLE_RATE);
-    println!("ES8311 initialized");
+    match es8311::init(&mut i2c, MCLK_HZ, SAMPLE_RATE) {
+        Ok(()) => println!("ES8311 initialized (MCLK={}Hz)", MCLK_HZ),
+        Err(e) => println!("ES8311 init FAILED: {:?} (no audio expected)", e),
+    }
 
     let dma_channel = unsafe { esp_hal::peripherals::DMA_CH0::steal() };
     let i2s_periph = unsafe { esp_hal::peripherals::I2S0::steal() };
@@ -1004,9 +1016,10 @@ fn i2s_playback(patch: &dx7_core::DxVoice) {
     .with_scl(i2c_scl)
     .with_sda(i2c_sda);
 
-    const MCLK_HZ: u32 = SAMPLE_RATE * 256;
-    es8311::init(&mut i2c, MCLK_HZ, SAMPLE_RATE);
-    println!("ES8311 initialized (MCLK={}Hz)", MCLK_HZ);
+    match es8311::init(&mut i2c, MCLK_HZ, SAMPLE_RATE) {
+        Ok(()) => println!("ES8311 initialized (MCLK={}Hz)", MCLK_HZ),
+        Err(e) => println!("ES8311 init FAILED: {:?} (no audio expected)", e),
+    }
 
     let dma_channel = unsafe { esp_hal::peripherals::DMA_CH0::steal() };
     let i2s_periph = unsafe { esp_hal::peripherals::I2S0::steal() };
@@ -1015,7 +1028,10 @@ fn i2s_playback(patch: &dx7_core::DxVoice) {
         Config::new_tdm_philips()
             .with_sample_rate(Rate::from_hz(SAMPLE_RATE))
             .with_data_format(DataFormat::Data16Channel16)
-            .with_channels(Channels::MONO),
+            // i2s_buf below is interleaved L/R, so the slot config must be
+            // STEREO; MONO made the codec consume one word per frame and
+            // played at the wrong pitch/duration.
+            .with_channels(Channels::STEREO),
     ).unwrap();
     let i2s = i2s.with_mclk(unsafe { esp_hal::peripherals::GPIO16::steal() });
 
@@ -1040,7 +1056,10 @@ fn i2s_playback(patch: &dx7_core::DxVoice) {
         voice.render(&mut output);
         if block == note_blocks / 2 { voice.note_off(); }
         for i in 0..N {
-            let sample = (output[i] >> 9) as i16;
+            // A single voice peaks at ~2^26. >>11 maps that to ~2^15 (full
+            // scale); clamp so anything above still saturates instead of
+            // wrapping in the i16 cast (the old >>9 wrapped on every peak).
+            let sample = (output[i] >> 11).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
             i2s_buf[i * 2] = sample;
             i2s_buf[i * 2 + 1] = sample;
         }
@@ -1090,11 +1109,17 @@ fn pwm_playback(patch: &dx7_core::DxVoice) {
         if block == note_blocks / 2 { voice.note_off(); }
         let block_start = read_ccount();
         for i in 0..N {
-            let signed = output[i] >> 17;
+            // Single-voice peak ~2^26 -> >>19 gives +-128, which centred on 128
+            // fills the 8-bit duty range without hard-clipping normal levels.
+            let signed = output[i] >> 19;
             let duty = (signed + 128).clamp(0, 255) as u32;
             channel0.set_duty_hw(duty);
             let target = block_start.wrapping_add(CYCLES_PER_SAMPLE * (i as u32 + 1));
-            while read_ccount().wrapping_sub(target) > CYCLES_PER_SAMPLE {}
+            // Spin only while we are *early* (signed difference negative). If
+            // we are already late, fall through immediately; the old unsigned
+            // comparison spun until CCOUNT wrapped (~27 s at 160 MHz) when more
+            // than one sample period late.
+            while (read_ccount().wrapping_sub(target) as i32) < 0 {}
         }
     }
     channel0.set_duty_hw(128);

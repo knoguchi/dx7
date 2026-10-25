@@ -1,10 +1,26 @@
 /// ES8311 audio codec driver (I2C register configuration).
 /// Based on Espressif's esp_codec_dev ES8311 driver (Apache-2.0).
 
-use esp_hal::i2c::master::I2c;
+use esp_hal::i2c::master::{Error as I2cError, I2c};
 use esp_hal::Blocking;
 
 const ADDR: u8 = 0x18;
+
+/// ES8311 driver error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Error {
+    /// An I2C register access failed (NACK, timeout, ...). Usually means the
+    /// codec is not on the bus at `ADDR` or the I2C pins are wrong.
+    I2c(I2cError),
+    /// No `COEFFS` row for this MCLK / sample-rate pair.
+    UnsupportedClock { mclk_hz: u32, sample_rate: u32 },
+}
+
+impl From<I2cError> for Error {
+    fn from(e: I2cError) -> Self {
+        Error::I2c(e)
+    }
+}
 
 // Registers
 const REG00_RESET: u8 = 0x00;
@@ -66,105 +82,125 @@ fn find_coeff(mclk: u32, rate: u32) -> Option<&'static CoeffDiv> {
     COEFFS.iter().find(|c| c.mclk == mclk && c.rate == rate)
 }
 
-fn wreg(i2c: &mut I2c<'_, Blocking>, reg: u8, val: u8) {
-    i2c.write(ADDR, &[reg, val]).ok();
+fn wreg(i2c: &mut I2c<'_, Blocking>, reg: u8, val: u8) -> Result<(), Error> {
+    i2c.write(ADDR, &[reg, val])?;
+    Ok(())
 }
 
-fn rreg(i2c: &mut I2c<'_, Blocking>, reg: u8) -> u8 {
+fn rreg(i2c: &mut I2c<'_, Blocking>, reg: u8) -> Result<u8, Error> {
     let mut buf = [0u8; 1];
-    i2c.write_read(ADDR, &[reg], &mut buf).ok();
-    buf[0]
+    i2c.write_read(ADDR, &[reg], &mut buf)?;
+    Ok(buf[0])
 }
 
 /// Initialize ES8311 for I2S DAC playback in slave mode.
 /// `mclk_hz`: MCLK frequency provided by ESP32 I2S (e.g. 12288000 for 48kHz * 256).
 /// `sample_rate`: target sample rate (48000 or 44100).
-pub fn init(i2c: &mut I2c<'_, Blocking>, mclk_hz: u32, sample_rate: u32) {
-    // Phase 1: Soft defaults (from es8311_open)
-    wreg(i2c, REG44_GPIO, 0x08); // I2C noise immunity
-    wreg(i2c, REG44_GPIO, 0x08); // write twice per Espressif recommendation
+///
+/// Returns the first I2C error encountered (previously every access was
+/// `.ok()`-ed and a missing codec went unnoticed), or `UnsupportedClock` if
+/// the MCLK/rate pair is not in `COEFFS`.
+pub fn init(i2c: &mut I2c<'_, Blocking>, mclk_hz: u32, sample_rate: u32) -> Result<(), Error> {
+    let coeff = find_coeff(mclk_hz, sample_rate)
+        .ok_or(Error::UnsupportedClock { mclk_hz, sample_rate })?;
 
-    wreg(i2c, REG01_CLK_MGR, 0x30);
-    wreg(i2c, REG02_CLK_MGR, 0x00);
-    wreg(i2c, REG03_CLK_MGR, 0x10);
-    wreg(i2c, REG16_ADC, 0x24);
-    wreg(i2c, REG04_CLK_MGR, 0x10);
-    wreg(i2c, REG05_CLK_MGR, 0x00);
-    wreg(i2c, REG0B_SYSTEM, 0x00);
-    wreg(i2c, REG0C_SYSTEM, 0x00);
-    wreg(i2c, REG10_SYSTEM, 0x1F);
-    wreg(i2c, REG11_SYSTEM, 0x7F);
-    wreg(i2c, REG00_RESET, 0x80); // out of reset, slave mode
+    // Phase 1: Soft defaults (from es8311_open)
+    wreg(i2c, REG44_GPIO, 0x08)?; // I2C noise immunity
+    wreg(i2c, REG44_GPIO, 0x08)?; // write twice per Espressif recommendation
+
+    wreg(i2c, REG01_CLK_MGR, 0x30)?;
+    wreg(i2c, REG02_CLK_MGR, 0x00)?;
+    wreg(i2c, REG03_CLK_MGR, 0x10)?;
+    wreg(i2c, REG16_ADC, 0x24)?;
+    wreg(i2c, REG04_CLK_MGR, 0x10)?;
+    wreg(i2c, REG05_CLK_MGR, 0x00)?;
+    wreg(i2c, REG0B_SYSTEM, 0x00)?;
+    wreg(i2c, REG0C_SYSTEM, 0x00)?;
+    wreg(i2c, REG10_SYSTEM, 0x1F)?;
+    wreg(i2c, REG11_SYSTEM, 0x7F)?;
+    wreg(i2c, REG00_RESET, 0x80)?; // out of reset, slave mode
 
     // MCLK from pin, not inverted, all clocks on
-    wreg(i2c, REG01_CLK_MGR, 0x3F);
+    wreg(i2c, REG01_CLK_MGR, 0x3F)?;
 
     // SCLK not inverted
-    let reg06 = rreg(i2c, REG06_CLK_MGR);
-    wreg(i2c, REG06_CLK_MGR, reg06 & !0x20);
+    let reg06 = rreg(i2c, REG06_CLK_MGR)?;
+    wreg(i2c, REG06_CLK_MGR, reg06 & !0x20)?;
 
-    wreg(i2c, REG13_SYSTEM, 0x10);
-    wreg(i2c, REG1B_ADC, 0x0A);
-    wreg(i2c, REG1C_ADC, 0x6A);
-    wreg(i2c, REG44_GPIO, 0x08); // no DAC ref to ADC
+    wreg(i2c, REG13_SYSTEM, 0x10)?;
+    wreg(i2c, REG1B_ADC, 0x0A)?;
+    wreg(i2c, REG1C_ADC, 0x6A)?;
+    wreg(i2c, REG44_GPIO, 0x08)?; // no DAC ref to ADC
 
     // Phase 2: Configure sample rate from coefficient table
-    if let Some(c) = find_coeff(mclk_hz, sample_rate) {
-        let mut reg02 = rreg(i2c, REG02_CLK_MGR) & 0x07;
+    {
+        let c = coeff;
+        let mut reg02 = rreg(i2c, REG02_CLK_MGR)? & 0x07;
         reg02 |= (c.pre_div - 1) << 5;
         let pre_multi_bits = match c.pre_multi {
             1 => 0, 2 => 1, 4 => 2, _ => 3,
         };
         reg02 |= pre_multi_bits << 3;
-        wreg(i2c, REG02_CLK_MGR, reg02);
+        wreg(i2c, REG02_CLK_MGR, reg02)?;
 
-        wreg(i2c, REG05_CLK_MGR, ((c.adc_div - 1) << 4) | (c.dac_div - 1));
+        wreg(i2c, REG05_CLK_MGR, ((c.adc_div - 1) << 4) | (c.dac_div - 1))?;
 
-        let reg03 = (rreg(i2c, REG03_CLK_MGR) & 0x80) | (c.fs_mode << 6) | c.adc_osr;
-        wreg(i2c, REG03_CLK_MGR, reg03);
+        let reg03 = (rreg(i2c, REG03_CLK_MGR)? & 0x80) | (c.fs_mode << 6) | c.adc_osr;
+        wreg(i2c, REG03_CLK_MGR, reg03)?;
 
-        let reg04 = (rreg(i2c, REG04_CLK_MGR) & 0x80) | c.dac_osr;
-        wreg(i2c, REG04_CLK_MGR, reg04);
+        let reg04 = (rreg(i2c, REG04_CLK_MGR)? & 0x80) | c.dac_osr;
+        wreg(i2c, REG04_CLK_MGR, reg04)?;
 
-        let reg07 = (rreg(i2c, REG07_CLK_MGR) & 0xC0) | c.lrck_h;
-        wreg(i2c, REG07_CLK_MGR, reg07);
-        wreg(i2c, REG08_CLK_MGR, c.lrck_l);
+        let reg07 = (rreg(i2c, REG07_CLK_MGR)? & 0xC0) | c.lrck_h;
+        wreg(i2c, REG07_CLK_MGR, reg07)?;
+        wreg(i2c, REG08_CLK_MGR, c.lrck_l)?;
 
-        let reg06v = (rreg(i2c, REG06_CLK_MGR) & 0xE0) | (c.bclk_div - 1);
-        wreg(i2c, REG06_CLK_MGR, reg06v);
+        let reg06v = (rreg(i2c, REG06_CLK_MGR)? & 0xE0) | (c.bclk_div - 1);
+        wreg(i2c, REG06_CLK_MGR, reg06v)?;
     }
 
     // Phase 3: Set format — I2S normal, 16-bit
-    let dac_iface = (rreg(i2c, REG09_SDP_IN) & 0xFC) | 0x0C; // I2S + 16bit
-    wreg(i2c, REG09_SDP_IN, dac_iface & 0xE3 | 0x0C);
-    let adc_iface = (rreg(i2c, REG0A_SDP_OUT) & 0xFC) | 0x0C;
-    wreg(i2c, REG0A_SDP_OUT, adc_iface & 0xE3 | 0x0C);
+    let dac_iface = (rreg(i2c, REG09_SDP_IN)? & 0xFC) | 0x0C; // I2S + 16bit
+    wreg(i2c, REG09_SDP_IN, dac_iface & 0xE3 | 0x0C)?;
+    let adc_iface = (rreg(i2c, REG0A_SDP_OUT)? & 0xFC) | 0x0C;
+    wreg(i2c, REG0A_SDP_OUT, adc_iface & 0xE3 | 0x0C)?;
 
     // Phase 4: Start — enable DAC path (from es8311_start, DAC-only mode)
-    wreg(i2c, REG00_RESET, 0x80); // slave mode
-    wreg(i2c, REG01_CLK_MGR, 0x3F); // MCLK on
+    //
+    // NOTE: REG00 is written again here, *after* the clock (REG02..REG08) and
+    // serial-port (REG09/REG0A) configuration above. This mirrors the order in
+    // Espressif's es8311_start() (which writes 0x80 for slave mode), and the
+    // value is identical to the Phase 1 write, so no reset bits (REG00[4:0])
+    // are toggled. It has NOT been verified against the ES8311 datasheet that
+    // a REG00 write with CSM_ON/MSC bits unchanged leaves the register file
+    // untouched. If audio is silent or at the wrong rate after init, this is
+    // the first line to check; the sequence is deliberately left as-is here.
+    wreg(i2c, REG00_RESET, 0x80)?; // slave mode
+    wreg(i2c, REG01_CLK_MGR, 0x3F)?; // MCLK on
 
     // Unmute DAC SDP, mute ADC SDP
-    let dac_sdp = rreg(i2c, REG09_SDP_IN) & !0x40;  // unmute DAC
-    wreg(i2c, REG09_SDP_IN, dac_sdp);
-    let adc_sdp = rreg(i2c, REG0A_SDP_OUT) | 0x40;  // mute ADC
-    wreg(i2c, REG0A_SDP_OUT, adc_sdp);
+    let dac_sdp = rreg(i2c, REG09_SDP_IN)? & !0x40;  // unmute DAC
+    wreg(i2c, REG09_SDP_IN, dac_sdp)?;
+    let adc_sdp = rreg(i2c, REG0A_SDP_OUT)? | 0x40;  // mute ADC
+    wreg(i2c, REG0A_SDP_OUT, adc_sdp)?;
 
-    wreg(i2c, REG17_ADC, 0xBF);
-    wreg(i2c, REG0E_SYSTEM, 0x02);
-    wreg(i2c, REG12_SYSTEM, 0x00);
-    wreg(i2c, REG14_SYSTEM, 0x1A);
-    wreg(i2c, REG0D_SYSTEM, 0x01);
-    wreg(i2c, REG15_ADC, 0x40);
-    wreg(i2c, REG37_DAC, 0x08);
-    wreg(i2c, REG45_GP, 0x00);
+    wreg(i2c, REG17_ADC, 0xBF)?;
+    wreg(i2c, REG0E_SYSTEM, 0x02)?;
+    wreg(i2c, REG12_SYSTEM, 0x00)?;
+    wreg(i2c, REG14_SYSTEM, 0x1A)?;
+    wreg(i2c, REG0D_SYSTEM, 0x01)?;
+    wreg(i2c, REG15_ADC, 0x40)?;
+    wreg(i2c, REG37_DAC, 0x08)?;
+    wreg(i2c, REG45_GP, 0x00)?;
 
     // Set DAC volume to -12dB (0xBF = 0dB, each step = 0.5dB)
-    wreg(i2c, REG32_DAC_VOL, 0xBF - 24);
+    wreg(i2c, REG32_DAC_VOL, 0xBF - 24)?;
+
+    Ok(())
 }
 
 /// Set DAC volume. 0x00 = -95.5dB, 0xBF = 0dB, 0xFF = +32dB.
 #[allow(dead_code)]
-pub fn set_volume(i2c: &mut I2c<'_, Blocking>, vol: u8) {
-    wreg(i2c, REG32_DAC_VOL, vol);
+pub fn set_volume(i2c: &mut I2c<'_, Blocking>, vol: u8) -> Result<(), Error> {
+    wreg(i2c, REG32_DAC_VOL, vol)
 }
