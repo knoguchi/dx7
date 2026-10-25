@@ -80,6 +80,9 @@ pub struct Voice {
     pub velocity: u8,
     /// True if NoteOff was received but sustain pedal is holding this voice.
     pub sustain_held: bool,
+    /// True while the voice is being stolen: the next render block ramps
+    /// every operator to silence and then marks the voice Inactive.
+    pub fading: bool,
     pub age: u32,
 
     // Per-operator state
@@ -116,6 +119,7 @@ impl Voice {
             channel: 0,
             velocity: 0,
             sustain_held: false,
+            fading: false,
             age: 0,
             params: [
                 FmOpParams::new(),
@@ -157,6 +161,7 @@ impl Voice {
         self.velocity = velocity;
         self.state = VoiceState::Active;
         self.sustain_held = false;
+        self.fading = false;
         self.age = 0;
 
         // DX7 patch transpose only applies to the local 61-key keyboard, not MIDI input.
@@ -263,6 +268,17 @@ impl Voice {
         }
     }
 
+    /// Begin a one-block fade-out for voice stealing. The next `render`
+    /// call ramps all operators from their current gain to silence over
+    /// N samples (about 1.5 ms) and then sets the voice Inactive, so the
+    /// caller can start the new note on the following block without a click.
+    /// No-op for an Inactive voice.
+    pub fn begin_fade(&mut self) {
+        if self.state != VoiceState::Inactive {
+            self.fading = true;
+        }
+    }
+
     /// Check if the voice is completely finished.
     pub fn is_finished(&self) -> bool {
         if self.state == VoiceState::Inactive {
@@ -340,6 +356,21 @@ impl Voice {
             } else {
                 self.params[op].freq = tables::freqlut_lookup(basepitch + pitch_mod);
             }
+        }
+
+        // --- Voice steal: target silence this block, then free the slot ---
+        if self.fading {
+            // Render normally, then apply a linear ramp to zero across the
+            // block. (Ramping the log-domain gain instead would be an
+            // exponential fade that drops ~16% on the first sample: a click.)
+            self.render_core(output);
+            for (i, s) in output.iter_mut().enumerate() {
+                *s = ((*s as i64 * (N - i) as i64) >> LG_N) as i32;
+            }
+            self.fading = false;
+            self.sustain_held = false;
+            self.state = VoiceState::Inactive;
+            return;
         }
 
         // --- Render via bus-flag routing (fm_core.cc render()) ---
@@ -1334,6 +1365,8 @@ mod tests {
         ensure_init();
         let mut synth = crate::synth::Synth::new(44100);
         synth.load_patch(test_patch(31, [0, 0, 0, 0, 0, 99], 0));
+        // This test checks a full-octave bend; the default range is 2 st.
+        synth.set_pitch_bend_range(12);
 
         // Play note without pitch bend
         synth.note_on(60, 100);
@@ -1346,6 +1379,7 @@ mod tests {
         // Reset and play with max pitch bend up (+8191)
         let mut synth2 = crate::synth::Synth::new(44100);
         synth2.load_patch(test_patch(31, [0, 0, 0, 0, 0, 99], 0));
+        synth2.set_pitch_bend_range(12);
         synth2.note_on(60, 100);
         synth2.pitch_bend(8191); // max up
         let mut bend_up = vec![0.0f32; 4096];

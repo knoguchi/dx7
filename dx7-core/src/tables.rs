@@ -289,12 +289,14 @@ mod tests {
 
     /// Issue #6: init_tables must be safe to call concurrently and
     /// repeatedly while other threads render.
+    /// (Only 44100 here: the sample-rate selection is process-global by
+    /// design, and other tests in this binary assume 44100.)
     #[test]
     fn test_concurrent_init_and_render() {
         let handles: Vec<_> = (0..8)
-            .map(|i| {
+            .map(|_| {
                 std::thread::spawn(move || {
-                    let sr = if i % 2 == 0 { 44100 } else { 48000 };
+                    let sr = 44100;
                     let mut synth = crate::synth::Synth::new(sr);
                     synth.load_patch(crate::patch::DxVoice::init_voice());
                     synth.note_on(60, 100);

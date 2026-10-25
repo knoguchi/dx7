@@ -24,10 +24,23 @@ pub struct Synth {
     sustain: bool,
     master_volume: f32,
     expression: f32,
-    /// Pitch bend in the internal log-frequency domain (±12 semitones).
+    /// Pitch bend in the internal log-frequency domain (Q24 octaves).
     pitch_bend_logfreq: i32,
-    /// Mod wheel value (0–127). Scales LFO pitch/amp modulation depth.
+    /// Last raw MIDI pitch bend value (-8192..8191), kept so a range change
+    /// re-applies to the current wheel position.
+    pitch_bend_raw: i16,
+    /// Pitch bend range in semitones for full wheel deflection. DX7 function
+    /// mode default is 2; RPN 0 (pitch bend sensitivity) also sets it.
+    pitch_bend_range: u8,
+    /// Registered parameter number selected via CC 101/100 (MSB, LSB).
+    /// 0x7F/0x7F means "null" (no RPN selected).
+    rpn: (u8, u8),
+    /// Mod wheel value (0–127). Adds LFO pitch/amp modulation on top of the
+    /// patch's own depth (see Voice::render).
     mod_wheel: i32,
+    /// Notes waiting for a stolen voice to finish its one-block fade-out:
+    /// (voice index, note, velocity). Applied at the end of the next block.
+    pending_notes: Vec<(usize, u8, u8)>,
     /// Internal scratch buffer for mixing (one N-sample block).
     mix_buffer: [i32; N],
     /// Residue buffer for sub-block alignment in render (stereo).
@@ -65,7 +78,11 @@ impl Synth {
             master_volume: 0.5,
             expression: 1.0,
             pitch_bend_logfreq: 0,
+            pitch_bend_raw: 0,
+            pitch_bend_range: 2,
+            rpn: (0x7F, 0x7F),
             mod_wheel: 0,
+            pending_notes: Vec::new(),
             mix_buffer: [0i32; N],
             stereo_residue: [0.0; N * 2],
             stereo_residue_len: 0,
@@ -97,13 +114,47 @@ impl Synth {
         }
 
         let voice_idx = self.allocate_voice();
-        self.voices[voice_idx].note_on(&self.current_patch, note, velocity);
+        let voice = &mut self.voices[voice_idx];
+        if voice.state == VoiceState::Inactive {
+            voice.note_on(&self.current_patch, note, velocity);
+        } else {
+            // Stealing a sounding voice: fade it out over the next block and
+            // start the new note after that, instead of cutting it (click).
+            voice.begin_fade();
+            if let Some(p) = self.pending_notes.iter_mut().find(|p| p.0 == voice_idx) {
+                p.1 = note;
+                p.2 = velocity;
+            } else {
+                self.pending_notes.push((voice_idx, note, velocity));
+            }
+        }
+    }
+
+    /// Start any notes whose stolen voice has finished fading. Called once
+    /// per rendered block, after the fade block.
+    fn start_pending_notes(&mut self) {
+        if self.pending_notes.is_empty() {
+            return;
+        }
+        let mut i = 0;
+        while i < self.pending_notes.len() {
+            let (idx, note, vel) = self.pending_notes[i];
+            if self.voices[idx].state == VoiceState::Inactive {
+                self.voices[idx].note_on(&self.current_patch, note, vel);
+                self.pending_notes.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// Trigger a note off. With the sustain pedal down the voice keeps
     /// sounding and is flagged `sustain_held`; the pedal release then
     /// releases exactly those voices, never a key that is still held.
     pub fn note_off(&mut self, note: u8) {
+        // A note released before its stolen voice finished fading never
+        // sounds at all (it was under 1.5 ms long).
+        self.pending_notes.retain(|p| p.1 != note);
         for voice in &mut self.voices {
             if voice.state == VoiceState::Active && voice.note == note && !voice.sustain_held {
                 if self.sustain {
@@ -181,15 +232,35 @@ impl Synth {
                     }
                 }
             }
+            // RPN select (MSB/LSB) and data entry. Only RPN 0 (pitch bend
+            // sensitivity, semitones in the data MSB) is implemented.
+            101 => self.rpn.0 = value & 0x7F,
+            100 => self.rpn.1 = value & 0x7F,
+            6 if self.rpn == (0, 0) => self.set_pitch_bend_range(value),
             _ => {}
         }
     }
 
+    /// Set the pitch bend range in semitones (0..=24) for full wheel
+    /// deflection. Re-applies the current wheel position immediately.
+    pub fn set_pitch_bend_range(&mut self, semitones: u8) {
+        self.pitch_bend_range = semitones.min(24);
+        self.pitch_bend(self.pitch_bend_raw);
+    }
+
+    /// Current pitch bend range in semitones.
+    pub fn pitch_bend_range(&self) -> u8 {
+        self.pitch_bend_range
+    }
+
+    /// Apply a raw MIDI pitch bend value (-8192..=8191).
     pub fn pitch_bend(&mut self, value: i16) {
-        // DX7 native: ±12 semitones = ±1 octave = ±(1<<24) in logfreq domain.
-        // MIDI pitch bend range: -8192..+8191.
-        // (1<<24) / 8192 = 2048.
-        self.pitch_bend_logfreq = value as i32 * 2048;
+        self.pitch_bend_raw = value;
+        // One octave is 1<<24 in the logfreq domain, so full deflection of
+        // `range` semitones is range * (1<<24) / 12, spread over 8192 steps:
+        // value * range * 2048 / 12.
+        let lf = value as i64 * self.pitch_bend_range as i64 * 2048 / 12;
+        self.pitch_bend_logfreq = lf as i32;
     }
 
     /// Render audio into the output buffer (interleaved stereo f32, -1.0..1.0).
@@ -232,6 +303,7 @@ impl Synth {
                     }
                 }
             }
+            self.start_pending_notes();
 
             // Convert full block to f32 stereo
             let mut block_stereo = [0.0f32; N * 2];
@@ -306,6 +378,7 @@ impl Synth {
                     }
                 }
             }
+            self.start_pending_notes();
 
             // Convert full block to f32: clip to 24-bit signed, shift >> 9, normalize
             // val >> 4 already done above; now clip to 24-bit, shift >> 9, normalize to float
@@ -347,26 +420,34 @@ impl Synth {
             }
         }
 
-        // 2. Find the oldest released voice
+        // 2. Find the oldest released voice that is not already being stolen
         let mut oldest_released: Option<(usize, u32)> = None;
         for (i, voice) in self.voices.iter().enumerate() {
             if voice.state == VoiceState::Released
-                && (oldest_released.is_none() || voice.age > oldest_released.unwrap().1) {
-                    oldest_released = Some((i, voice.age));
-                }
+                && !voice.fading
+                && (oldest_released.is_none() || voice.age > oldest_released.unwrap().1)
+            {
+                oldest_released = Some((i, voice.age));
+            }
         }
         if let Some((idx, _)) = oldest_released {
             return idx;
         }
 
-        // 3. Steal the oldest active voice
-        let mut oldest_active: (usize, u32) = (0, 0);
+        // 3. Steal the oldest active voice (again preferring one not already
+        //    fading; if every voice is fading, take the oldest anyway and the
+        //    pending note for it is replaced).
+        let mut oldest: (usize, u32) = (0, 0);
+        let mut oldest_not_fading: Option<(usize, u32)> = None;
         for (i, voice) in self.voices.iter().enumerate() {
-            if voice.age > oldest_active.1 {
-                oldest_active = (i, voice.age);
+            if voice.age >= oldest.1 {
+                oldest = (i, voice.age);
+            }
+            if !voice.fading && oldest_not_fading.is_none_or(|(_, a)| voice.age > a) {
+                oldest_not_fading = Some((i, voice.age));
             }
         }
-        oldest_active.0
+        oldest_not_fading.unwrap_or(oldest).0
     }
 }
 
@@ -430,5 +511,121 @@ mod tests {
             s.note_off(60);
         }
         assert_eq!(s.voices.iter().filter(|v| v.sustain_held).count(), 1);
+    }
+
+    /// Upward zero-crossing frequency estimate over a stereo buffer.
+    fn est_freq(out: &[f32]) -> f64 {
+        let mono: Vec<f32> = out.iter().step_by(2).copied().collect();
+        let n = mono.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count();
+        n as f64 / (mono.len() as f64 / 44100.0)
+    }
+
+    /// Issue #8: default bend range is 2 semitones; RPN 0 and
+    /// set_pitch_bend_range change it.
+    #[test]
+    fn test_pitch_bend_range_default_and_rpn() {
+        let mut s = Synth::new(44100);
+        s.load_patch(DxVoice::init_voice());
+        s.note_on(69, 100);
+        let mut warm = vec![0.0f32; 44100];
+        s.render(&mut warm);
+
+        let mut base = vec![0.0f32; 88200];
+        s.render(&mut base);
+        let f0 = est_freq(&base);
+
+        s.pitch_bend(8191);
+        let mut bent = vec![0.0f32; 88200];
+        s.render(&mut bent);
+        let f2 = est_freq(&bent);
+        let ratio = f2 / f0;
+        assert!(
+            (ratio - 1.1225).abs() < 0.02,
+            "default range 2 st: expected ratio ~1.1225, got {ratio:.4} ({f0:.1} -> {f2:.1})"
+        );
+
+        // RPN 0 (CC101=0, CC100=0, CC6=12) -> 12 semitones; wheel still up.
+        s.control_change(101, 0);
+        s.control_change(100, 0);
+        s.control_change(6, 12);
+        assert_eq!(s.pitch_bend_range(), 12);
+        let mut bent12 = vec![0.0f32; 88200];
+        s.render(&mut bent12);
+        let ratio12 = est_freq(&bent12) / f0;
+        assert!(
+            (ratio12 - 2.0).abs() < 0.05,
+            "range 12 st: expected ratio ~2.0, got {ratio12:.4}"
+        );
+
+        // Data entry with a different RPN selected must not touch the range.
+        s.control_change(100, 1);
+        s.control_change(6, 3);
+        assert_eq!(s.pitch_bend_range(), 12);
+    }
+
+    /// Issue #9: stealing a voice must not produce a discontinuity larger
+    /// than the natural per-sample slope of the signal.
+    #[test]
+    fn test_voice_steal_has_no_click() {
+        let mut s = Synth::with_max_voices(44100, 1);
+        s.load_patch(DxVoice::init_voice());
+        s.note_on(69, 127);
+        let mut warm = vec![0.0f32; 44100];
+        s.render(&mut warm);
+
+        // Steady-state slope reference.
+        let mut steady = vec![0.0f32; 8192];
+        s.render(&mut steady);
+        let max_step = |buf: &[f32]| {
+            buf.iter()
+                .step_by(2)
+                .collect::<Vec<_>>()
+                .windows(2)
+                .map(|w| (w[1] - w[0]).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let steady_step = max_step(&steady);
+        let steady_peak = steady.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+
+        // Steal: a second note on a 1-voice synth. Inspect only the fade
+        // block itself (first N frames): the new note's own fast attack that
+        // follows is normal DX7 behaviour, not a steal artefact.
+        s.note_on(45, 127);
+        let mut steal = vec![0.0f32; 8192];
+        s.render(&mut steal);
+        let steal_step = max_step(&steal[..N * 2]);
+        assert!(
+            steal_step < steady_step * 2.0,
+            "steal should fade, not cut: max step {steal_step:.4} vs steady {steady_step:.4} (peak {steady_peak:.3})"
+        );
+        // End of the fade block must be (near) silent before the new note starts.
+        let last = steal[N * 2 - 2].abs();
+        assert!(last < steady_peak * 0.05, "fade should end near zero, got {last:.4}");
+
+        // The new note is actually playing afterwards.
+        let mut after = vec![0.0f32; 88200];
+        s.render(&mut after);
+        let f = est_freq(&after);
+        assert!((f - 110.0).abs() < 5.0, "stolen voice should now play A2 (110 Hz), got {f:.1}");
+        assert!(s.pending_notes.is_empty());
+    }
+
+    /// Issue #9: a NoteOff that arrives while the stolen voice is still
+    /// fading cancels the pending note instead of leaving it hanging.
+    #[test]
+    fn test_pending_note_cancelled_by_note_off() {
+        let mut s = Synth::with_max_voices(44100, 1);
+        s.load_patch(DxVoice::init_voice());
+        s.note_on(69, 100);
+        let mut buf = vec![0.0f32; 4096];
+        s.render(&mut buf);
+        s.note_on(45, 100);
+        assert_eq!(s.pending_notes.len(), 1);
+        s.note_off(45);
+        assert!(s.pending_notes.is_empty());
+        let mut tail = vec![0.0f32; 44100];
+        s.render(&mut tail);
+        let peak = tail[tail.len() - 2048..].iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+        assert!(peak < 0.001, "nothing should be sounding, peak={peak}");
     }
 }
