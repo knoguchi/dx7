@@ -4,7 +4,7 @@
 
 # DX7
 
-A Yamaha DX7 FM synthesizer emulator in Rust.
+A Yamaha DX7 FM synthesizer emulator in Rust: a desktop synth and renderer, and the same engine as firmware for a Raspberry Pi Pico 2 W and an ESP32-S3 board with a round touch display.
 
 ## Demo
 
@@ -94,6 +94,57 @@ absolute levels, `--sample-rate 48000` sets the output rate (44100 or 48000).
 ```
 cargo run --release --package dx7-app -- --list-midi
 ```
+
+## Hardware
+
+The same engine runs as a standalone instrument on two boards. BLE MIDI is the
+primary input: pair a keyboard or phone, pick a patch, play. USB MIDI works on
+both as well.
+
+|                | Raspberry Pi Pico 2 W (`dx7-rp2350`) | ESP32-S3 1.28" round-LCD board (`dx7-esp32s3`) |
+|----------------|--------------------------------------|-------------------------------------------------|
+| MCU            | RP2350, 2x Cortex-M33 @ 200 MHz      | ESP32-S3, 2x Xtensa LX7 @ 160 MHz               |
+| Polyphony      | 10 voices (5 per core)               | 8 voices (4 per core)                           |
+| Audio out      | PWM on GP15 fed by DMA ping-pong, RC low-pass to a jack | 16-bit 48 kHz I2S into the ES8311 codec and NS4150B speaker amp (LEDC PWM on GPIO4 for a bare module) |
+| MIDI in        | BLE MIDI over the CYW43439, USB MIDI | BLE MIDI, USB MIDI                              |
+| UI             | Onboard LED (blinks while advertising, solid when connected); mode and channel set by SysEx | 240x240 GC9A01 round LCD shows the patch name; CST816D touch: swipe up/down changes patch, swipe left plays a chord |
+| Modes          | DX7 (one patch, like the original) and General MIDI (16 channels, drums on 10), switched by SysEx | DX7 |
+| Output stage   | DC blocker, 4th-order Butterworth low-pass at 10.5 kHz, soft clip | same |
+| Bank loading   | 32-voice SysEx bulk dump over BLE or USB | ROM1A built in                        |
+
+Both firmwares advertise as **"DX7"** and implement the standard MIDI over
+BLE service, so any BLE MIDI controller or macOS/iOS/Android host can connect.
+
+### Signal path
+
+```
+ BLE / USB ──► MIDI parser ──► MidiQueue ──► dispatch: voice allocation, CCs, SysEx
+                                                   │
+                     ┌─────────────────────────────┴─────────────────────────────┐
+             core 0: render voices 0..N/2                           core 1: render voices N/2..N
+                     └─────────────────────────────┬─────────────────────────────┘
+                                   mix one 64-sample block (1.33 ms at 48 kHz)
+                                                   │
+                       DC blocker ──► Butterworth LPF ──► soft clip ──► DMA ──► PWM / I2S
+```
+
+Core 0 runs the async executor (radio or USB stack, MIDI, half the voices,
+DMA buffer refill). Core 1 does nothing but render its half of the voice pool,
+handshaking with core 0 through two atomics once per block. The DMA engine
+streams the finished block to the PWM slice or the I2S peripheral with no CPU
+involvement, so a late block shows up as a counted underrun rather than a
+crash. On the ESP32-S3 one voice block costs about 30k cycles, roughly 190 µs
+at 160 MHz against the 1333 µs deadline.
+
+### Bill of materials
+
+- **Pico 2 W build**: a Pico 2 W, a 1 kΩ resistor and 100 nF capacitor for
+  the PWM low-pass, and a headphone jack or small amplifier. Wiring and the
+  flash procedure are in [dx7-rp2350/README.md](dx7-rp2350/README.md).
+- **ESP32-S3 build**: an "ESP32-S3 1.28inch BOX" style board (ESP32-S3,
+  ES8311 codec, speaker amp, GC9A01 LCD, CST816D touch), nothing external.
+  Pin map, toolchain setup and flashing are in
+  [dx7-esp32s3/README.md](dx7-esp32s3/README.md).
 
 ## SysEx Banks
 
