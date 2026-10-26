@@ -13,8 +13,8 @@ integer-only signal path.
   range (RPN 0), and 44.1/48 kHz output (`std` feature)
 - The 32 ROM1A factory voices built in
 
-Runs on desktop and on microcontrollers (RP2350, ESP32-S3) at about 10
-voices per 200 MHz core.
+Runs on desktop and on microcontrollers: 10 voices across the two 200 MHz
+cores of an RP2350, 8 voices across the two 160 MHz cores of an ESP32-S3.
 
 ## Example
 

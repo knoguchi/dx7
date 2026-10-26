@@ -112,7 +112,7 @@ The `ble-midi` feature enables wireless MIDI input over Bluetooth Low Energy. Co
 
 - Advertises as **"DX7"**
 - Implements the standard [MIDI over BLE](https://www.midi.org/specifications/midi-transports-specifications/specification-for-midi-over-bluetooth-low-energy-ble-midi) service
-- Supports Note On/Off, Control Change, and Program Change
+- Supports Note On/Off, Control Change (mod wheel, sustain, volume), Pitch Bend, and Program Change
 - Uses [trouble-host](https://github.com/embassy-rs/trouble) for the BLE GATT server and [esp-radio](https://github.com/esp-rs/esp-hal) for the radio driver
 
 Connect from any BLE MIDI controller or app (e.g. KORG microKEY Air, macOS Audio MIDI Setup, Android MIDI).

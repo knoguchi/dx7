@@ -104,7 +104,8 @@ pub struct Voice {
 
     /// Pitch bend offset in the log-frequency domain (set by Synth each block).
     pub pitch_bend: i32,
-    /// Mod wheel value 0–127 (set by Synth each block). Scales LFO mod depths.
+    /// Mod wheel value 0–127 (set by Synth each block). Adds LFO pitch/amp
+    /// modulation on top of the patch's own depth; see `render`.
     pub mod_wheel: i32,
 
     // Intermediate buffers for bus rendering
@@ -1394,7 +1395,7 @@ mod tests {
             "Pitch bend up should raise frequency: no_bend={xings_no_bend}, bend_up={xings_bend_up}"
         );
 
-        // DX7 default is ±12 semitones = ±1 octave
+        // Range set to 12 semitones above, so a full bend is one octave
         // Max bend should roughly double the frequency
         let ratio = xings_bend_up as f64 / xings_no_bend as f64;
         assert!(

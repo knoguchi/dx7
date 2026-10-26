@@ -10,8 +10,12 @@ rustup target add thumbv8m.main-none-eabihf
 
 # Flash tool (pick one)
 cargo install probe-rs-tools   # debug probe (SWD)
-cargo install elf2uf2-rs       # UF2 drag-and-drop
+# or picotool (used by the uf2-deploy runner): https://github.com/raspberrypi/picotool
 ```
+
+Note: if you also have a Homebrew/system `cargo` on your PATH, make sure
+`~/.cargo/bin` comes first so the rustup toolchain (which has the
+`thumbv8m` target) is the one that runs.
 
 ## Build
 
@@ -38,7 +42,7 @@ Hold BOOTSEL and plug in the Pico, then:
 cargo run --release --features "usb-midi,ble-midi,pwm"
 ```
 
-The `uf2-deploy` script converts the ELF to UF2 and copies it to the RP2350 USB drive automatically.
+The `uf2-deploy` script converts the ELF to UF2 with `picotool` and copies it to the `RP2350` BOOTSEL volume (macOS path `/Volumes/RP2350`; edit the script for other OSes).
 
 ### Via debug probe (SWD)
 
@@ -49,8 +53,8 @@ probe-rs run --chip RP2350 target/thumbv8m.main-none-eabihf/release/dx7-rp2350
 ### Via UF2 manual copy
 
 ```bash
-elf2uf2-rs target/thumbv8m.main-none-eabihf/release/dx7-rp2350 dx7-rp2350.uf2
-# Copy dx7-rp2350.uf2 to the RPI-RP2 USB drive
+picotool uf2 convert target/thumbv8m.main-none-eabihf/release/dx7-rp2350 dx7-rp2350.uf2 --family rp2350-arm-s
+# Copy dx7-rp2350.uf2 to the RP2350 USB drive
 ```
 
 ## Features
@@ -60,13 +64,13 @@ elf2uf2-rs target/thumbv8m.main-none-eabihf/release/dx7-rp2350 dx7-rp2350.uf2
 | `pwm`      | PWM audio on GP15              | Yes   | No (demo)  | Any Pico 2    |
 | `usb-midi` | USB MIDI class device          | —     | Yes        | Any Pico 2    |
 | `ble-midi` | BLE MIDI via CYW43439          | —     | Yes        | Pico 2 **W**  |
-| `i2s`      | PIO I2S for external DAC       | Yes   | No         | Any Pico 2    |
-| `uart-midi`| Classic 31250 baud MIDI        | —     | Yes        | Any Pico 2    |
 
 Typical combinations:
 - `--features "usb-midi,pwm"` — USB MIDI live synth
 - `--features "ble-midi,pwm"` — wireless BLE MIDI synth
 - `--features "usb-midi,ble-midi,pwm"` — both USB and BLE MIDI simultaneously
+
+`i2s` and `uart-midi` are declared in `Cargo.toml` as placeholders but have no code behind them yet.
 
 ## Architecture
 
@@ -120,10 +124,6 @@ BLE packets are parsed per the BLE-MIDI 1.0 spec: header byte, then per message 
 | Function   | GPIO  | Feature     | Notes                          |
 |------------|-------|-------------|--------------------------------|
 | PWM audio  | GP15  | `pwm`       | RC filter → speaker/headphones |
-| I2S BCK    | GP16  | `i2s`       | PCM5102A DAC                   |
-| I2S LRCK   | GP17  | `i2s`       |                                |
-| I2S DOUT   | GP18  | `i2s`       |                                |
-| UART RX    | GP1   | `uart-midi` | DIN-5 / TRS connector          |
 | CYW43 SPI  | GP23,24,25,29 | `ble-midi` | Hardwired on Pico 2 W   |
 | USB        | —     | `usb-midi`  | Internal USB controller        |
 
@@ -138,7 +138,7 @@ GP15 ──[1kΩ]──┬── audio out
               GND
 ```
 
-Cutoff frequency: ~1.6 kHz (adequate for demo; use I2S + DAC for quality audio).
+Cutoff frequency: ~1.6 kHz (adequate for a demo; an I2S DAC output is planned but not implemented).
 
 ## Performance
 
