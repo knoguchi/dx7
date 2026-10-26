@@ -22,11 +22,11 @@ Note: if you also have a Homebrew/system `cargo` on your PATH, make sure
 ```bash
 cd dx7-rp2350
 
+# BLE MIDI synth with PWM audio (Pico 2 W only) — primary configuration
+cargo build --release --features "ble-midi,pwm"
+
 # USB MIDI synth with PWM audio
 cargo build --release --features "usb-midi,pwm"
-
-# BLE MIDI synth with PWM audio (Pico 2 W only)
-cargo build --release --features "ble-midi,pwm"
 
 # USB + BLE MIDI synth with PWM audio (Pico 2 W only)
 cargo build --release --features "usb-midi,ble-midi,pwm"
@@ -65,10 +65,10 @@ picotool uf2 convert target/thumbv8m.main-none-eabihf/release/dx7-rp2350 dx7-rp2
 | `usb-midi` | USB MIDI class device          | —     | Yes        | Any Pico 2    |
 | `ble-midi` | BLE MIDI via CYW43439          | —     | Yes        | Pico 2 **W**  |
 
-Typical combinations:
-- `--features "usb-midi,pwm"` — USB MIDI live synth
-- `--features "ble-midi,pwm"` — wireless BLE MIDI synth
-- `--features "usb-midi,ble-midi,pwm"` — both USB and BLE MIDI simultaneously
+BLE MIDI is the primary way to connect; USB MIDI is also supported. Typical combinations:
+- `--features "ble-midi,pwm"` — wireless BLE MIDI synth (primary)
+- `--features "usb-midi,ble-midi,pwm"` — BLE plus USB MIDI simultaneously
+- `--features "usb-midi,pwm"` — USB MIDI only
 
 `i2s` and `uart-midi` are declared in `Cargo.toml` as placeholders but have no code behind them yet.
 

@@ -17,8 +17,8 @@ https://github.com/knoguchi/dx7/raw/main/demo/epiano1_intro_demo.mp4
 - **dx7-core** — Platform-independent synthesis engine (`no_std` capable, zero dependencies). See [dx7-core/README.md](dx7-core/README.md).
 - **dx7-midi** — `no_std` USB-MIDI / BLE-MIDI parsers, message queue, General MIDI sound set. See [dx7-midi/README.md](dx7-midi/README.md).
 - **dx7-app** — Desktop CLI: real-time audio, MIDI input (USB, optional BLE and RTP-MIDI), computer keyboard, MIDI file rendering.
-- **dx7-rp2350** — Firmware for Raspberry Pi Pico 2 / Pico 2 W (10 voices, USB and BLE MIDI, PWM audio). See [dx7-rp2350/README.md](dx7-rp2350/README.md).
-- **dx7-esp32s3** — Firmware for ESP32-S3 boards (8 voices, ES8311 I2S codec, round LCD with touch, BLE and USB MIDI). See [dx7-esp32s3/README.md](dx7-esp32s3/README.md).
+- **dx7-rp2350** — Firmware for Raspberry Pi Pico 2 W (10 voices, BLE MIDI as the primary input, USB MIDI too, PWM audio). See [dx7-rp2350/README.md](dx7-rp2350/README.md).
+- **dx7-esp32s3** — Firmware for ESP32-S3 boards (8 voices, BLE MIDI as the primary input, USB MIDI too, ES8311 I2S codec, round LCD with touch). See [dx7-esp32s3/README.md](dx7-esp32s3/README.md).
 
 ## Build
 
