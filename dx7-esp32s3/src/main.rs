@@ -373,7 +373,74 @@ async fn main(_spawner: embassy_executor::Spawner) {
     ble_midi_synth(peripherals.BT).await;
 }
 
-// === BLE MIDI live synth (4 voices, I2S ES8311 output) ===
+/// Touch UI handling shared by the BLE and USB audio loops: swipe up/down
+/// steps the ROM1A program, swipe left plays a C major chord for about one
+/// second. Gestures arrive from `lcd::ui_task` through `lcd::SWIPE_CHANNEL`;
+/// this runs on the audio path and does no I/O itself.
+#[cfg(feature = "lcd")]
+struct TouchUi {
+    /// Blocks remaining until the demo chord is released (0 = none pending).
+    chord_off_countdown: u32,
+}
+
+#[cfg(feature = "lcd")]
+impl TouchUi {
+    const CHORD: [u8; 3] = [60, 64, 67]; // C4 E4 G4
+
+    fn new() -> Self {
+        Self { chord_off_countdown: 0 }
+    }
+
+    /// Call once per audio block, before draining the MIDI queue.
+    fn poll(
+        &mut self,
+        voices: &mut [Voice; MAX_VOICES],
+        voice_ages: &mut [u32; MAX_VOICES],
+        voice_age: &mut u32,
+        ch: &mut ChannelState,
+    ) {
+        if let Ok(swipe) = lcd::SWIPE_CHANNEL.try_receive() {
+            match swipe {
+                lcd::Swipe::Up | lcd::Swipe::Down => {
+                    // Step from the program actually loaded (ch.program is also
+                    // updated by Program Change, so swipe and PC stay in sync).
+                    let new_prog = match swipe {
+                        lcd::Swipe::Up => if ch.program < 31 { ch.program + 1 } else { 0 },
+                        _ => if ch.program > 0 { ch.program - 1 } else { 31 },
+                    };
+                    if let Some(p) = load_rom1a_voice(new_prog as usize) {
+                        lcd::request_draw(new_prog, p.name_str());
+                        ch.program = new_prog;
+                        ch.patch = p;
+                    }
+                }
+                lcd::Swipe::Left => {
+                    for &note in &Self::CHORD {
+                        dispatch_midi(
+                            dx7_midi::MidiMessage::NoteOn { channel: 0, note, velocity: 100 },
+                            voices, voice_ages, voice_age, ch,
+                        );
+                    }
+                    self.chord_off_countdown = SAMPLE_RATE / (N as u32); // ~1 s in blocks
+                }
+            }
+        }
+
+        if self.chord_off_countdown > 0 {
+            self.chord_off_countdown -= 1;
+            if self.chord_off_countdown == 0 {
+                for &note in &Self::CHORD {
+                    dispatch_midi(
+                        dx7_midi::MidiMessage::NoteOff { channel: 0, note, velocity: 0 },
+                        voices, voice_ages, voice_age, ch,
+                    );
+                }
+            }
+        }
+    }
+}
+
+// === BLE MIDI live synth (MAX_VOICES voices, I2S ES8311 output) ===
 #[cfg(feature = "ble-midi")]
 async fn ble_midi_synth(bluetooth: esp_hal::peripherals::BT<'static>) -> ! {
     use trouble_host::prelude::*;
@@ -507,51 +574,11 @@ async fn ble_midi_synth(bluetooth: esp_hal::peripherals::BT<'static>) -> ! {
         #[allow(static_mut_refs)]
         let mut dma_transfer = i2s_tx.write_dma_circular(unsafe { &mut DMA_BUF }).unwrap();
         #[cfg(feature = "lcd")]
-        let mut chord_off_countdown: u32 = 0;
+        let mut touch = TouchUi::new();
         loop {
             // Touch gestures arrive from lcd::ui_task; no I2C/SPI on this path.
             #[cfg(feature = "lcd")]
-            if let Ok(swipe) = lcd::SWIPE_CHANNEL.try_receive() {
-                match swipe {
-                    lcd::Swipe::Up | lcd::Swipe::Down => {
-                        // Step from the program actually loaded (ch.program is also
-                        // updated by Program Change, so swipe and PC stay in sync).
-                        let new_prog = match swipe {
-                            lcd::Swipe::Up => if ch.program < 31 { ch.program + 1 } else { 0 },
-                            _ => if ch.program > 0 { ch.program - 1 } else { 31 },
-                        };
-                        if let Some(p) = load_rom1a_voice(new_prog as usize) {
-                            lcd::request_draw(new_prog, p.name_str());
-                            ch.program = new_prog;
-                            ch.patch = p;
-                        }
-                    }
-                    lcd::Swipe::Left => {
-                        // Play C major chord: C4 E4 G4, auto note-off after ~1s
-                        for &note in &[60u8, 64, 67] {
-                            dispatch_midi(
-                                dx7_midi::MidiMessage::NoteOn { channel: 0, note, velocity: 100 },
-                                voices, voice_ages, voice_age, &mut ch,
-                            );
-                        }
-                        chord_off_countdown = (SAMPLE_RATE as u32) / (N as u32); // ~1 second in blocks
-                    }
-                }
-            }
-
-            // Auto note-off for touch chord
-            #[cfg(feature = "lcd")]
-            if chord_off_countdown > 0 {
-                chord_off_countdown -= 1;
-                if chord_off_countdown == 0 {
-                    for &note in &[60u8, 64, 67] {
-                        dispatch_midi(
-                            dx7_midi::MidiMessage::NoteOff { channel: 0, note, velocity: 0 },
-                            voices, voice_ages, voice_age, &mut ch,
-                        );
-                    }
-                }
-            }
+            touch.poll(voices, voice_ages, voice_age, &mut ch);
 
             // Drain MIDI queue
             while let Some(msg) = MIDI_QUEUE.pop() {
@@ -810,7 +837,13 @@ async fn usb_midi_synth() -> ! {
         #[cfg(feature = "es8311")]
         #[allow(static_mut_refs)]
         let mut dma_transfer = i2s_tx.write_dma_circular(unsafe { &mut DMA_BUF }).unwrap();
+        #[cfg(feature = "lcd")]
+        let mut touch = TouchUi::new();
         loop {
+            // Touch gestures (swipe = program step, left = chord), same as BLE build.
+            #[cfg(feature = "lcd")]
+            touch.poll(voices, voice_ages, voice_age, &mut ch);
+
             while let Some(msg) = MIDI_QUEUE.pop() {
                 dispatch_midi(msg, voices, voice_ages, voice_age, &mut ch);
             }
